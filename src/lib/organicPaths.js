@@ -3,8 +3,9 @@
 // ============================================================
 import {
   polygonBBox, clampPointToBBox, pointInPoly, gaussian, segmentsIntersect, polygonCentroid,
-  reflexVertexIndices, signedDistanceToPolygon, polygonSignedArea,
+  reflexVertexIndices, signedDistanceToPolygon, polygonSignedArea, closestPointOnPolyline,
 } from "./geometryUtils";
+import { MIN_PEDESTRIAN_WIDTH_MM, MIN_TILES_ACROSS } from "./constants";
 
 export function catmullRom(points, samplesPerSeg = 16) {
   const pts = points;
@@ -284,6 +285,43 @@ export function makeOrganicRoutedPath(a, b, wobble, rng, boundaryPoly, exclusion
     full = full.concat(legPoly.slice(1));
   }
   return validateRoutedCurve(full, waypoints, boundaryPoly, clearanceMm, inflated);
+}
+
+// Chains makeOrganicRoutedPath across a user-supplied sequence of points (3+), one leg per
+// consecutive pair, concatenating results -- the same "route each leg independently, wobble
+// stays local" approach makeOrganicRoutedPath already uses internally for its own multi-corner
+// case above, just exposed here for an arbitrary caller-chosen waypoint chain (e.g. a
+// hand-placed meander track) instead of one derived from routeWithinBoundary.
+export function makeOrganicMultiWaypointPath(points, wobble, rng, boundaryPoly, exclusionZones, clearanceMm = 300) {
+  let full = [points[0]];
+  for (let i = 0; i < points.length - 1; i++) {
+    const leg = makeOrganicRoutedPath(points[i], points[i + 1], wobble, rng, boundaryPoly, exclusionZones, clearanceMm);
+    full = full.concat(leg.slice(1));
+  }
+  return full;
+}
+
+// Nearest point to `p` on any main-path centerline (open polylines) or patio outline (closed
+// polygons) -- used to snap a meander track's endpoints onto whatever it's meant to be
+// branching off of, so it never floats free in open space. Falls back to `p` unchanged if
+// there's nothing to snap to yet.
+export function snapToPathOrPatio(p, mainPathPolys, patioPolys) {
+  let best = null, bestDist = Infinity;
+  for (const mp of mainPathPolys || []) {
+    const hit = closestPointOnPolyline(p, mp.poly, false);
+    if (hit && hit.dist < bestDist) { bestDist = hit.dist; best = hit.point; }
+  }
+  for (const poly of patioPolys || []) {
+    const hit = closestPointOnPolyline(p, poly, true);
+    if (hit && hit.dist < bestDist) { bestDist = hit.dist; best = hit.point; }
+  }
+  return best || p;
+}
+
+export function validatePathWidth(widthMm, acrossMm) {
+  const required = Math.max(MIN_PEDESTRIAN_WIDTH_MM, MIN_TILES_ACROSS * acrossMm);
+  const clamped = Math.max(widthMm, required);
+  return { clamped, wasClamped: clamped !== widthMm, required };
 }
 
 export function makePatioBlob(center, baseRadius, rng, jitter = 0.24, nPts = 16, boundaryPoly = null, boundaryClearanceMm = 0) {

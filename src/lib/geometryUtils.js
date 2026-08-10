@@ -48,6 +48,29 @@ export function pointSegDist(p, a, b) {
   return Math.hypot(p[0] - proj[0], p[1] - proj[1]);
 }
 
+// nearest point (and its distance) anywhere along a chain of segments -- `points` as an open
+// polyline by default, or treated as a closed polygon (last point wraps to the first) when
+// `closed` is true. Same per-segment projection as pointSegDist, but returning the point
+// itself rather than just the distance, since callers here need somewhere to snap TO.
+export function closestPointOnPolyline(p, points, closed = false) {
+  let best = null, bestDist = Infinity;
+  const n = points.length;
+  const segCount = closed ? n : n - 1;
+  for (let i = 0; i < segCount; i++) {
+    const a = points[i], b = points[(i + 1) % n];
+    const d = pointSegDist(p, a, b);
+    if (d < bestDist) {
+      bestDist = d;
+      const ab = [b[0] - a[0], b[1] - a[1]];
+      const denom = ab[0] * ab[0] + ab[1] * ab[1] + 1e-9;
+      let t = ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / denom;
+      t = Math.min(Math.max(t, 0), 1);
+      best = [a[0] + t * ab[0], a[1] + t * ab[1]];
+    }
+  }
+  return best ? { point: best, dist: bestDist } : null;
+}
+
 export function signedDistanceToPolygon(p, poly) {
   // positive = depth inside the polygon (this IS the paving 'margin' for a patio, whether
   // it's a jittered circular blob or a freeform user-drawn shape -- both are just polygons

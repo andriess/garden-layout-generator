@@ -15,15 +15,17 @@ import {
 } from "./lib/constants";
 import {
   mulberry32, polygonBBox, pointInPoly, pointSegDist, signedDistanceToPolygon, polygonCentroid,
-  polygonEdgeLengths, polylineSegmentLengths, pointAtDistance,
+  polygonEdgeLengths, polylineSegmentLengths, pointAtDistance, closestPointOnPolyline,
 } from "./lib/geometryUtils";
 import { hexSizeFromPaver, hexCorners, makeHexGrid, squareCorners, rectCorners, makeRectGrid } from "./lib/tileGrids";
-import { makeOrganicRoutedPath, makePatioBlob, sampleAlongPolyline, squarePolygonFromDrag, rectPolygonFromDrag, circlePolygonFromDrag } from "./lib/organicPaths";
+import {
+  makeOrganicRoutedPath, makeOrganicMultiWaypointPath, snapToPathOrPatio, validatePathWidth,
+  makePatioBlob, sampleAlongPolyline, squarePolygonFromDrag, rectPolygonFromDrag, circlePolygonFromDrag,
+} from "./lib/organicPaths";
 import { resizeSquareToSide, resizeRectToDims, resizeCircleToDiameter } from "./lib/shapeEdit";
 import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
-import { generateMeanderTracks, validatePathWidth } from "./lib/meanderTracks";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
-import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, validateImportPayload, maxIdSuffix } from "./lib/persistence";
+import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, migrateDesignPayload, validateImportPayload, maxIdSuffix } from "./lib/persistence";
 import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
 
 // ============================================================
@@ -97,8 +99,9 @@ export default function GardenPavingDesigner() {
   const [forkTo, setForkTo] = useState("");
   const [forkWidth, setForkWidth] = useState(350);
 
-  // --- meander (desire) tracks ---
-  const [meanderCount, setMeanderCount] = useState(3);
+  // --- meander (desire) tracks: user-placed waypoint chains, routed leg-by-leg with the
+  // same organic path algorithm as main paths (makeOrganicMultiWaypointPath) ---
+  const [meanderPaths, setMeanderPaths] = useState([]); // [{id, waypoints: [[x,y],...]}]
   const [meanderDensity, setMeanderDensity] = useState(0.55);
   const [meanderClearanceMm, setMeanderClearanceMm] = useState(300);
   const [showMeander, setShowMeander] = useState(true);
@@ -327,22 +330,15 @@ export default function GardenPavingDesigner() {
   const zonePolys = useMemo(() => boundedVoronoiPolygons(zoneSeeds, boundaryBBox), [zoneSeeds, boundaryBBox]);
 
   // ---- tile paving selection: core (on path/patio) + scatter (fringe) ----
+  // meander tracks: same organic routing as main paths, chained across the user's own
+  // hand-placed waypoints instead of a pair of anchors -- see makeOrganicMultiWaypointPath.
   const meanderTracks = useMemo(() => {
-    if (!hasBoundary || !showMeander || meanderCount <= 0) return [];
-    return generateMeanderTracks({
-      anchors,
-      connections,
-      mainPathPolys: pathPolys,
-      patioPolys: patioBlobs.map((b) => b.poly),
-      count: meanderCount,
-      minPathClearanceMm: meanderClearanceMm,
-      minBoundaryClearanceMm: boundaryClearanceMm,
-      boundaryPoly: gardenBoundary,
-      exclusionPolys: exclusionZones.map((z) => z.poly),
-      minTrackSepMm: 500,
-      seed: meanderSeed * 7159 + 11,
-    });
-  }, [hasBoundary, showMeander, meanderCount, meanderClearanceMm, anchors, connections, pathPolys, patioBlobs, gardenBoundary, exclusionZones, meanderSeed, boundaryClearanceMm]);
+    if (!hasBoundary || !showMeander || meanderPaths.length === 0) return [];
+    const localRng = mulberry32(seed * 6089 + 29);
+    return meanderPaths
+      .filter((m) => m.waypoints.length >= 2)
+      .map((m) => makeOrganicMultiWaypointPath(m.waypoints, wobbleMm, localRng, gardenBoundary, exclusionZones, meanderClearanceMm));
+  }, [hasBoundary, showMeander, meanderPaths, gardenBoundary, exclusionZones, meanderClearanceMm, wobbleMm, seed]);
 
   const paved = useMemo(() => {
     const scatterRng = mulberry32(seed * 7919 + 3);
@@ -421,6 +417,19 @@ export default function GardenPavingDesigner() {
     return best && bestDist <= toleranceMm ? best : null;
   }, [editablePolys]);
 
+  // meander tracks are open waypoint chains, not closed polygons, so they don't fit
+  // editablePolys/findShapeNear (built around signedDistanceToPolygon) -- hit-tested
+  // separately against each track's raw hand-placed waypoints.
+  const findMeanderNear = useCallback((pt, toleranceMm) => {
+    let best = null, bestDist = Infinity;
+    for (const m of meanderPaths) {
+      if (m.waypoints.length < 2) continue;
+      const hit = closestPointOnPolyline(pt, m.waypoints, false);
+      if (hit && hit.dist < bestDist) { bestDist = hit.dist; best = m; }
+    }
+    return best && bestDist <= toleranceMm ? best : null;
+  }, [meanderPaths]);
+
   const selectedShapeData = useMemo(() => {
     if (!selectedShape) return null;
     return editablePolys.find((s) => s.kind === selectedShape.kind && s.id === selectedShape.id) || null;
@@ -483,16 +492,18 @@ export default function GardenPavingDesigner() {
   }, [selectedShapeData, setShapePolygon]);
 
   // ---- interactions: click-to-place, drag-to-move ----
-  const FREEFORM_MODES = ["draw-patio", "draw-boundary", "draw-exclusion"];
+  const FREEFORM_MODES = ["draw-patio", "draw-boundary", "draw-exclusion", "draw-meander"];
   const SHAPE_PRESET_MODES = ["draw-square", "draw-rect", "draw-circle", "draw-exclusion-rect"];
 
   const handleCanvasClick = (evt) => {
     if (!placeMode) {
-      // idle mode: clicking near a drawn shape's outline selects it for vertex editing;
-      // clicking empty canvas deselects (and dismisses any open anchor radial menu)
+      // idle mode: clicking near a drawn shape's outline (or a meander track's waypoint
+      // chain) selects it for vertex editing; clicking empty canvas deselects (and dismisses
+      // any open anchor radial menu)
       const [x, y] = svgPointFromEvent(evt);
       const hit = findShapeNear([x, y], HIT_TOLERANCE_PX * mmPerPx);
-      setSelectedShape(hit ? { kind: hit.kind, id: hit.id } : null);
+      const meanderHit = !hit ? findMeanderNear([x, y], HIT_TOLERANCE_PX * mmPerPx) : null;
+      setSelectedShape(hit ? { kind: hit.kind, id: hit.id } : meanderHit ? { kind: "meander", id: meanderHit.id } : null);
       setAnchorMenuId(null);
       return;
     }
@@ -535,7 +546,7 @@ export default function GardenPavingDesigner() {
 
   // finishes whatever freeform shape is currently being drawn, routing to the right target
   const finishFreeformDraw = () => {
-    if (drawPoints.length < 3) return;
+    if (placeMode === "draw-meander" ? drawPoints.length < 2 : drawPoints.length < 3) return;
     if (placeMode === "draw-patio") {
       const newId = addPatioFromPolygon(drawPoints, "freeform");
       if (newId) setSelectedShape({ kind: "patio", id: newId });
@@ -551,8 +562,26 @@ export default function GardenPavingDesigner() {
       const newId = addExclusionFromPolygon(drawPoints, "freeform");
       if (newId) setSelectedShape({ kind: "exclusion", id: newId });
     }
+    else if (placeMode === "draw-meander") {
+      // start and end always snap onto the nearest main-path centerline or patio outline, so
+      // a meander track always reads as branching off something rather than floating free
+      const patioPolys = patioBlobs.map((b) => b.poly);
+      const lastIdx = drawPoints.length - 1;
+      const waypoints = drawPoints.map((p, i) => {
+        if (i !== 0 && i !== lastIdx) return p;
+        const [sx, sy] = snapToPathOrPatio(p, pathPolys, patioPolys);
+        return [Math.round(sx), Math.round(sy)];
+      });
+      const newId = nextUid();
+      setMeanderPaths((prev) => [...prev, { id: newId, waypoints }]);
+      setSelectedShape({ kind: "meander", id: newId });
+    }
     setDrawPoints([]);
     setPlaceMode(null);
+  };
+  const removeMeanderPath = (id) => {
+    setMeanderPaths((prev) => prev.filter((m) => m.id !== id));
+    setSelectedShape((s) => (s && s.kind === "meander" && s.id === id ? null : s));
   };
   const cancelFreeformDraw = () => {
     setDrawPoints([]);
@@ -650,6 +679,19 @@ export default function GardenPavingDesigner() {
           const [cx, cy] = polygonCentroid(nextPoly);
           return { ...a, customPolygon: nextPoly, x: Math.round(cx), y: Math.round(cy) };
         }));
+      } else if (kind === "meander") {
+        setMeanderPaths((prev) => prev.map((m) => {
+          if (m.id !== id) return m;
+          // the start/end waypoint stays snapped to whatever path/patio it's nearest to,
+          // even while being dragged around -- interior waypoints move freely
+          const isEndpoint = index === 0 || index === m.waypoints.length - 1;
+          let point = [rx, ry];
+          if (isEndpoint) {
+            const [sx, sy] = snapToPathOrPatio([x, y], pathPolys, patioBlobs.map((b) => b.poly));
+            point = [Math.round(sx), Math.round(sy)];
+          }
+          return { ...m, waypoints: m.waypoints.map((p, i) => (i === index ? point : p)) };
+        }));
       }
       return;
     }
@@ -742,7 +784,7 @@ export default function GardenPavingDesigner() {
       gardenW, gardenH, gardenBoundary, boundaryShapeKind, exclusionZones,
       tileShape, paverAcrossFlats, paverSize, paverWidth, paverHeight, rectBond, rotationDeg,
       anchors, connections,
-      meanderCount, meanderDensity, meanderClearanceMm, showMeander, meanderSeed,
+      meanderPaths, meanderDensity, meanderClearanceMm, showMeander, meanderSeed,
       zoneCount, relaxIters, wobbleMm, seed,
       scatterDensity, scatterMaxMm,
       showZones, showTiles, showBoundary, showAnchors, showCenterlines, showPlanting,
@@ -785,6 +827,8 @@ export default function GardenPavingDesigner() {
       window.alert(err.message);
       return;
     }
+    const { payload: migrated, notes } = migrateDesignPayload(payload);
+    payload = migrated;
     const { kind, errors } = validateImportPayload(payload);
     if (!kind || errors.length > 0) {
       window.alert(`Could not import "${file.name}":\n${errors.join("\n")}`);
@@ -799,7 +843,10 @@ export default function GardenPavingDesigner() {
       setExclusionZones(payload.exclusionZones);
       bumpUidCounterPast(payload.exclusionZones.map((z) => z.id));
     } else {
-      if (!window.confirm("Import full design? This replaces everything currently on screen.")) return;
+      const confirmMsg = notes.length > 0
+        ? `Import full design? This replaces everything currently on screen.\n\n${notes.join("\n")}`
+        : "Import full design? This replaces everything currently on screen.";
+      if (!window.confirm(confirmMsg)) return;
       setGardenW(payload.gardenW);
       setGardenH(payload.gardenH);
       setGardenBoundary(payload.gardenBoundary);
@@ -814,7 +861,7 @@ export default function GardenPavingDesigner() {
       setRotationDeg(payload.rotationDeg);
       setAnchors(payload.anchors);
       setConnections(payload.connections);
-      setMeanderCount(payload.meanderCount);
+      setMeanderPaths(payload.meanderPaths);
       setMeanderDensity(payload.meanderDensity);
       setMeanderClearanceMm(payload.meanderClearanceMm);
       setShowMeander(payload.showMeander);
@@ -831,7 +878,7 @@ export default function GardenPavingDesigner() {
       setShowAnchors(payload.showAnchors);
       setShowCenterlines(payload.showCenterlines);
       setShowPlanting(payload.showPlanting);
-      bumpUidCounterPast([...payload.exclusionZones.map((z) => z.id), ...payload.anchors.map((a) => a.id)]);
+      bumpUidCounterPast([...payload.exclusionZones.map((z) => z.id), ...payload.anchors.map((a) => a.id), ...payload.meanderPaths.map((m) => m.id)]);
     }
     resetTransientToolState();
     if (payload.gardenBoundary.length >= 3) fitViewToPoints(payload.gardenBoundary);
@@ -1122,16 +1169,49 @@ export default function GardenPavingDesigner() {
         <Section title="Meander (desire) tracks">
           <div style={{ fontSize: 10, color: INK_SOFT, marginBottom: 6 }}>
             Informal wandering shortcuts, branching off the main paths -- sparse, broken tiling,
-            never a guaranteed solid core. Routed with A* over a clearance grid (like the
-            original prototype's Dijkstra approach), so it can genuinely find a path through a
-            gap rather than just getting lucky with a random curve -- but it can still fail if
-            no route exists at all through the remaining void space.
+            never a guaranteed solid core. Place waypoints by hand; the start and end always
+            snap onto the nearest path centerline or patio outline, routed leg-by-leg the same
+            way as a normal path.
           </div>
-          <Row label={`Track count (${meanderCount})`}><input type="range" min={0} max={10} value={meanderCount} onChange={(e) => setMeanderCount(+e.target.value)} style={{ width: "100%" }} /></Row>
+          <div style={{ marginBottom: 10 }}>
+            <PlaceButton
+              active={placeMode === "draw-meander"}
+              onClick={() => { setDrawPoints([]); setPlaceMode(placeMode === "draw-meander" ? null : "draw-meander"); }}
+              icon={<Plus size={13} />}
+              label="Place meander path"
+              fullWidth
+            />
+          </div>
+          {placeMode === "draw-meander" && (
+            <div style={{ marginBottom: 10, padding: "8px 10px", background: "#F1ECE0", borderRadius: 5 }}>
+              <div style={{ fontSize: 11, color: ACCENT, marginBottom: 6 }}>
+                Click to add waypoints ({drawPoints.length} so far). Needs at least 2 -- start
+                and end will snap to the nearest path or patio.
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={finishFreeformDraw} disabled={drawPoints.length < 2}
+                  style={{ ...primaryBtnStyle, flex: 1, opacity: drawPoints.length < 2 ? 0.4 : 1, cursor: drawPoints.length < 2 ? "not-allowed" : "pointer" }}>
+                  Finish path
+                </button>
+                <button onClick={cancelFreeformDraw} style={{ ...primaryBtnStyle, background: PANEL_BORDER, color: INK, flex: 1 }}>Cancel</button>
+              </div>
+            </div>
+          )}
+          {meanderPaths.map((m) => (
+            <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0", borderBottom: `1px solid ${PANEL_BORDER}` }}>
+              <span
+                onClick={() => setSelectedShape({ kind: "meander", id: m.id })}
+                style={{ fontSize: 10.5, color: INK_SOFT, flex: 1, cursor: "pointer" }}
+              >
+                {m.waypoints.length} waypoints
+              </span>
+              <button onClick={() => removeMeanderPath(m.id)} style={iconBtnStyle}><Trash2 size={12} /></button>
+            </div>
+          ))}
           <Row label={`Stepping density (${meanderDensity.toFixed(2)})`}><input type="range" min={0.1} max={1} step={0.05} value={meanderDensity} onChange={(e) => setMeanderDensity(+e.target.value)} style={{ width: "100%" }} /></Row>
-          <Row label={`Clearance from paths (${meanderClearanceMm}mm)`}><input type="range" min={150} max={600} step={25} value={meanderClearanceMm} onChange={(e) => setMeanderClearanceMm(+e.target.value)} style={{ width: "100%" }} /></Row>
+          <Row label={`Clearance from boundary/houses (${meanderClearanceMm}mm)`}><input type="range" min={150} max={600} step={25} value={meanderClearanceMm} onChange={(e) => setMeanderClearanceMm(+e.target.value)} style={{ width: "100%" }} /></Row>
           <button onClick={() => setMeanderSeed((s) => s + 1)} style={{ ...primaryBtnStyle, width: "100%", marginTop: 6, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-            <RefreshCw size={13} /> Reroll tracks
+            <RefreshCw size={13} /> Reroll stepping stones
           </button>
         </Section>
 
@@ -1146,10 +1226,9 @@ export default function GardenPavingDesigner() {
         </Section>
 
         <div style={{ marginTop: 18, padding: "10px 12px", background: "#F1ECE0", borderRadius: 6, fontSize: 10.5, color: INK_SOFT, lineHeight: 1.5 }}>
-          Most tracks are deliberately routed through the most open point of whichever pocket
-          connects their two ends -- worth the extra distance so the track actually passes
-          through the space, rather than just skirting its minimum-clearance edge. A track can
-          still fail to route if no two candidate points share a connected pocket at all.
+          Meander tracks don't auto-route around other paths or patios -- only the boundary and
+          house/exclusion zones, same as normal paths. If a track's leg crosses something it
+          shouldn't, drag a waypoint (or add another one) to steer around it.
         </div>
       </div>
 
@@ -1159,7 +1238,7 @@ export default function GardenPavingDesigner() {
           <Stat label="Paved tiles" value={`${coreCount + scatterCount + meanderTileCount} / ${totalGardenTiles}`} />
           <Stat label="Core" value={coreCount} />
           <Stat label="Scatter" value={scatterCount} />
-          <Stat label="Meander" value={`${meanderTileCount} (${meanderTracks.length}/${meanderCount} tracks)`} />
+          <Stat label="Meander" value={`${meanderTileCount} (${meanderPaths.length} tracks)`} />
           <Stat label="Coverage" value={`${totalGardenTiles ? Math.round((100 * (coreCount + scatterCount + meanderTileCount)) / totalGardenTiles) : 0}%`} />
           <div style={{ flex: 1 }} />
           <div style={{ display: "flex", gap: 10 }}>
@@ -1294,6 +1373,27 @@ export default function GardenPavingDesigner() {
                 />
               </foreignObject>
             ))}
+
+            {/* selected meander track: raw hand-placed waypoint chain + draggable handles --
+                a separate open-polyline analog of the closed-shape block above, since meander
+                tracks aren't part of editablePolys/selectedShapeData */}
+            {selectedShape?.kind === "meander" && (() => {
+              const m = meanderPaths.find((mp) => mp.id === selectedShape.id);
+              if (!m) return null;
+              return (
+                <g>
+                  <polyline points={m.waypoints.map((p) => p.join(",")).join(" ")}
+                    fill="none" stroke={ACCENT} strokeWidth={SELECTION_STROKE_PX * mmPerPx}
+                    strokeDasharray={`${SELECTION_DASH_PX[0] * mmPerPx} ${SELECTION_DASH_PX[1] * mmPerPx}`} />
+                  {m.waypoints.map((p, i) => (
+                    <circle key={i} cx={p[0]} cy={p[1]} r={HANDLE_RADIUS_PX * mmPerPx}
+                      fill={PAPER} stroke={ACCENT} strokeWidth={HANDLE_STROKE_PX * mmPerPx}
+                      onMouseDown={handleVertexPointerDown("meander", m.id, i)}
+                      style={{ cursor: "grab" }} />
+                  ))}
+                </g>
+              );
+            })()}
 
             {FREEFORM_MODES.includes(placeMode) && drawPoints.length > 0 && (
               <g>

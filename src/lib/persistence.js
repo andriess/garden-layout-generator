@@ -7,7 +7,7 @@
 
 export const BOUNDARY_FILE_TYPE = "garden-boundary";
 export const DESIGN_FILE_TYPE = "garden-design";
-export const FILE_FORMAT_VERSION = 1;
+export const FILE_FORMAT_VERSION = 2;
 
 // fields that make up "the site" -- boundary + house/exclusion footprint -- as opposed to
 // the rest of a design (tiles, paths, zones, scatter...) built on top of it
@@ -17,7 +17,7 @@ export const BOUNDARY_FIELD_NAMES = ["gardenW", "gardenH", "gardenBoundary", "bo
 export const DESIGN_ONLY_FIELD_NAMES = [
   "tileShape", "paverAcrossFlats", "paverSize", "paverWidth", "paverHeight", "rectBond", "rotationDeg",
   "anchors", "connections",
-  "meanderCount", "meanderDensity", "meanderClearanceMm", "showMeander", "meanderSeed",
+  "meanderPaths", "meanderDensity", "meanderClearanceMm", "showMeander", "meanderSeed",
   "zoneCount", "relaxIters", "wobbleMm", "seed",
   "scatterDensity", "scatterMaxMm",
   "showZones", "showTiles", "showBoundary", "showAnchors", "showCenterlines", "showPlanting",
@@ -62,6 +62,30 @@ export async function readImportFile(file) {
   }
 }
 
+// ---- migration ---------------------------------------------------------------------
+// Brings an older save file's shape up to what the current app expects, so a file someone
+// already has on disk still imports instead of being flatly rejected. Runs before
+// validateImportPayload -- validation then only has to understand the current format.
+//
+// v1 -> v2: meander tracks used to be algorithmically generated from meanderCount/meanderSeed
+// rather than stored as explicit waypoints, so there's no actual track geometry in a v1 file
+// to carry forward -- the old fields never recorded where a track went, only how many to
+// generate and a seed to regenerate them with an algorithm that no longer exists. The honest
+// migration is dropping them and telling the user, not fabricating waypoints that were never
+// there.
+export function migrateDesignPayload(obj) {
+  if (!obj || typeof obj !== "object" || obj.type !== DESIGN_FILE_TYPE || Array.isArray(obj.meanderPaths)) {
+    return { payload: obj, notes: [] };
+  }
+  const oldCount = typeof obj.meanderCount === "number" ? obj.meanderCount : null;
+  const trackWord = oldCount === 1 ? "track" : "tracks";
+  const countPhrase = oldCount === null ? "any auto-generated meander tracks" : `its ${oldCount} auto-generated meander ${trackWord}`;
+  return {
+    payload: { ...obj, meanderPaths: [] },
+    notes: [`This file predates hand-placed meander tracks -- ${countPhrase} couldn't be carried over and were dropped. Everything else imported as-is; use "Place meander path" to add new ones.`],
+  };
+}
+
 // ---- validation -------------------------------------------------------------------
 const isPoint = (p) => Array.isArray(p) && p.length === 2 && p.every((n) => typeof n === "number" && Number.isFinite(n));
 const isPoly = (p) => Array.isArray(p) && p.every(isPoint);
@@ -95,6 +119,15 @@ function validateAnchorsAndConnections(obj, errors) {
   });
 }
 
+function validateMeanderPaths(obj, errors) {
+  if (!Array.isArray(obj.meanderPaths)) { errors.push('"meanderPaths" must be an array'); return; }
+  obj.meanderPaths.forEach((m, i) => {
+    if (!m || typeof m.id !== "string" || !isPoly(m.waypoints) || m.waypoints.length < 2) {
+      errors.push(`meanderPaths[${i}] is malformed`);
+    }
+  });
+}
+
 // Inspects a parsed JSON payload and reports which kind of save file it is (if any) plus
 // any structural problems found. Callers decide what to do with `errors` -- currently App.jsx
 // blocks import entirely on any error rather than trying to partially recover.
@@ -112,6 +145,7 @@ export function validateImportPayload(obj) {
   validateBoundaryFields(obj, errors);
   if (kind === "design") {
     validateAnchorsAndConnections(obj, errors);
+    validateMeanderPaths(obj, errors);
     for (const f of DESIGN_ONLY_FIELD_NAMES) {
       if (!(f in obj)) errors.push(`missing field "${f}"`);
     }
