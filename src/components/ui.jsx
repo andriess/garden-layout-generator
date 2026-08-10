@@ -1,7 +1,11 @@
 // ============================================================
 // small presentational helpers used throughout the control rail
 // ============================================================
-import { INK, INK_SOFT, PAPER, PANEL_BORDER, ACCENT } from "../lib/constants";
+import { Link2, Trash2 } from "lucide-react";
+import {
+  INK, INK_SOFT, PAPER, PANEL_BORDER, ACCENT,
+  ANCHOR_MENU_BUTTON_PX, ANCHOR_MENU_ICON_PX, ANCHOR_MENU_OFFSET_X_PX, ANCHOR_MENU_OFFSET_Y_PX,
+} from "../lib/constants";
 
 export function Section({ title, children }) {
   return (
@@ -60,6 +64,50 @@ export function NumInput({ value, onChange, step = 1 }) {
       style={{ width: "100%", padding: "5px 8px", fontSize: 12, border: `1px solid ${PANEL_BORDER}`, borderRadius: 4, background: PAPER, color: INK }} />
   );
 }
+// Small circular action button used by AnchorRadialMenu, rendered inside a foreignObject
+// -- fixed screen-px size (via mmPerPx) so it stays a comfortable tap target at any zoom.
+function RadialMenuButton({ mmPerPx, offsetXPx, x, y, danger, icon, onClick }) {
+  const sizePx = ANCHOR_MENU_BUTTON_PX;
+  return (
+    <foreignObject
+      x={x + offsetXPx * mmPerPx - (sizePx / 2) * mmPerPx}
+      y={y - ANCHOR_MENU_OFFSET_Y_PX * mmPerPx - (sizePx / 2) * mmPerPx}
+      width={sizePx * mmPerPx}
+      height={sizePx * mmPerPx}
+      style={{ overflow: "visible" }}
+    >
+      <button
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        style={{
+          width: "100%", height: "100%", borderRadius: "50%", display: "flex",
+          alignItems: "center", justifyContent: "center", cursor: "pointer",
+          border: `${1 * mmPerPx}px solid ${danger ? "#B4483A" : ACCENT}`,
+          background: PAPER, color: danger ? "#B4483A" : ACCENT,
+          boxShadow: `0 ${1 * mmPerPx}px ${3 * mmPerPx}px rgba(0,0,0,0.18)`, padding: 0,
+        }}
+      >
+        {icon}
+      </button>
+    </foreignObject>
+  );
+}
+
+// Radial menu shown next to an anchor after clicking it (idle mode): Link (start the
+// connect flow from this anchor) and Delete. Positioned by an mm-space point + mmPerPx,
+// same "fixed on-screen size" trick as the length-edit inputs in App.jsx.
+export function AnchorRadialMenu({ x, y, mmPerPx, onLink, onDelete }) {
+  const iconPx = ANCHOR_MENU_ICON_PX;
+  return (
+    <g>
+      <RadialMenuButton mmPerPx={mmPerPx} x={x} y={y} offsetXPx={-ANCHOR_MENU_OFFSET_X_PX}
+        icon={<Link2 size={iconPx} />} onClick={onLink} />
+      <RadialMenuButton mmPerPx={mmPerPx} x={x} y={y} offsetXPx={ANCHOR_MENU_OFFSET_X_PX}
+        danger icon={<Trash2 size={iconPx} />} onClick={onDelete} />
+    </g>
+  );
+}
+
 export const selectStyle = { padding: "5px 6px", fontSize: 11.5, border: `1px solid ${PANEL_BORDER}`, borderRadius: 4, background: PAPER, color: INK };
 export const tinyInputStyle = { padding: "2px 5px", fontSize: 11, border: `1px solid ${PANEL_BORDER}`, borderRadius: 3, background: PAPER, color: INK };
 export const iconBtnStyle = { border: "none", background: "none", cursor: "pointer", color: INK_SOFT, padding: 2, display: "flex" };

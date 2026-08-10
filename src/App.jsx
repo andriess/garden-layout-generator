@@ -24,7 +24,7 @@ import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
 import { generateMeanderTracks, validatePathWidth } from "./lib/meanderTracks";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
 import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, validateImportPayload, maxIdSuffix } from "./lib/persistence";
-import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
+import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
 
 // ============================================================
 // Main component
@@ -83,6 +83,8 @@ export default function GardenPavingDesigner() {
   // starts a rubber-band line; releasing over a *different* anchor commits a connection.
   const [connectFromId, setConnectFromId] = useState(null);
   const [connectPreviewPoint, setConnectPreviewPoint] = useState(null);
+  // click an anchor (idle mode) to open a small radial menu next to it: Link / Delete
+  const [anchorMenuId, setAnchorMenuId] = useState(null);
 
   // --- vector point editing: select a drawn polygon (boundary / exclusion zone / custom
   // patio shape) by clicking its outline, then drag its vertex handles to reshape it ---
@@ -145,6 +147,7 @@ export default function GardenPavingDesigner() {
     if (placeMode) {
       setSelectedShape(null);
       setDraggedVertex(null);
+      setAnchorMenuId(null);
     }
   }, [placeMode]);
 
@@ -171,6 +174,7 @@ export default function GardenPavingDesigner() {
   useEffect(() => {
     const isEditable = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT");
     const onKeyDown = (e) => {
+      if (e.key === "Escape") setAnchorMenuId(null);
       if (e.code === "Space" && !isEditable(document.activeElement)) {
         e.preventDefault();
         setSpaceHeld(true);
@@ -485,10 +489,11 @@ export default function GardenPavingDesigner() {
   const handleCanvasClick = (evt) => {
     if (!placeMode) {
       // idle mode: clicking near a drawn shape's outline selects it for vertex editing;
-      // clicking empty canvas deselects
+      // clicking empty canvas deselects (and dismisses any open anchor radial menu)
       const [x, y] = svgPointFromEvent(evt);
       const hit = findShapeNear([x, y], HIT_TOLERANCE_PX * mmPerPx);
       setSelectedShape(hit ? { kind: hit.kind, id: hit.id } : null);
+      setAnchorMenuId(null);
       return;
     }
     if (placeMode === "connect") {
@@ -582,13 +587,21 @@ export default function GardenPavingDesigner() {
 
   const handleAnchorPointerDown = (id) => (evt) => {
     evt.stopPropagation();
+    setAnchorMenuId(null); // a drag supersedes any open radial menu
     if (placeMode === "connect") return; // connect tool is click-driven, see handleAnchorClick
     setDragId(id);
   };
-  // click on an anchor while the connect tool is active: first click selects the source
+  // click on an anchor: in idle mode this opens/closes a small radial menu (Link/Delete)
+  // next to the anchor; while the connect tool is active, first click selects the source
   // anchor, a second click on a *different* anchor commits the connection, and clicking
-  // the same anchor again cancels the selection.
+  // the same anchor again cancels the selection. Any other tool (drawing/placing) lets the
+  // click fall through unhandled, so e.g. freeform drawing over an anchor still works.
   const handleAnchorClick = (id) => (evt) => {
+    if (!placeMode) {
+      evt.stopPropagation();
+      setAnchorMenuId((prev) => (prev === id ? null : id));
+      return;
+    }
     if (placeMode !== "connect") return;
     evt.stopPropagation();
     if (!connectFromId) {
@@ -687,6 +700,17 @@ export default function GardenPavingDesigner() {
     setAnchors((prev) => prev.filter((a) => a.id !== id));
     setConnections((prev) => prev.filter((c) => c.a !== id && c.b !== id));
     setSelectedShape((s) => (s && s.kind === "patio" && s.id === id ? null : s));
+    setAnchorMenuId((m) => (m === id ? null : m));
+  };
+  // radial-menu actions: Link hands off into the existing two-click connect flow, pre-seeded
+  // with this anchor as the source; Delete reuses removeAnchor's cascade delete.
+  const linkFromAnchorMenu = (id) => {
+    const a = anchorById[id];
+    if (!a) return;
+    setPlaceMode("connect");
+    setConnectFromId(id);
+    setConnectPreviewPoint([a.x, a.y]);
+    setAnchorMenuId(null);
   };
   const removeExclusionZone = (id) => {
     setExclusionZones((prev) => prev.filter((x) => x.id !== id));
@@ -1369,6 +1393,18 @@ export default function GardenPavingDesigner() {
                 <text x={a.x} y={a.y - ANCHOR_LABEL_OFFSET_MM} fontSize={ANCHOR_LABEL_FONT_MM} fill={INK} textAnchor="middle" style={{ userSelect: "none" }}>{a.label}</text>
               </g>
             ))}
+
+            {/* radial action menu -- opened by clicking an anchor while idle (see
+                handleAnchorClick); only ever one open at a time */}
+            {!placeMode && anchorMenuId && anchorById[anchorMenuId] && (
+              <AnchorRadialMenu
+                x={anchorById[anchorMenuId].x}
+                y={anchorById[anchorMenuId].y}
+                mmPerPx={mmPerPx}
+                onLink={() => linkFromAnchorMenu(anchorMenuId)}
+                onDelete={() => removeAnchor(anchorMenuId)}
+              />
+            )}
           </svg>
 
           {/* current drawing scale -- reflects zoom level, like a real scale drawing */}
