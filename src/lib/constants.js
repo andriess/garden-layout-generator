@@ -68,3 +68,13 @@ export const MAX_VIEWPORT_WIDTH_MM = 300000; // ~300m wide
 export const LENGTH_LABEL_FONT_PX = 11;
 export const LENGTH_INPUT_WIDTH_PX = 64;
 export const LENGTH_INPUT_HEIGHT_PX = 20;
+
+// ============================================================
+// Anchor radial action menu (click an anchor -> Link/Delete buttons) -- screen-px
+// constants, same reasoning as the length-edit block above: fixed on-screen size at any
+// zoom, converted to mm via mmPerPx at the point of use.
+// ============================================================
+export const ANCHOR_MENU_BUTTON_PX = 26;
+export const ANCHOR_MENU_ICON_PX = 13;
+export const ANCHOR_MENU_OFFSET_X_PX = 22;
+export const ANCHOR_MENU_OFFSET_Y_PX = 28;
