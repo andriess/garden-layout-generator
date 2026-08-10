@@ -10,10 +10,15 @@ import {
   CONNECT_PREVIEW_STROKE_MM, ANCHOR_SELECT_RING_R_MM, ANCHOR_SELECT_RING_STROKE_MM,
   ANCHOR_DOOR_HALF_MM, ANCHOR_STROKE_MM, ANCHOR_JUNCTION_SIZE_MM, ANCHOR_PATIO_R_MM,
   ANCHOR_LABEL_OFFSET_MM, ANCHOR_LABEL_FONT_MM, MIN_VIEWPORT_WIDTH_MM, MAX_VIEWPORT_WIDTH_MM,
+  LENGTH_LABEL_FONT_PX, LENGTH_INPUT_WIDTH_PX, LENGTH_INPUT_HEIGHT_PX,
 } from "./lib/constants";
-import { mulberry32, polygonBBox, pointInPoly, pointSegDist, signedDistanceToPolygon, polygonCentroid } from "./lib/geometryUtils";
+import {
+  mulberry32, polygonBBox, pointInPoly, pointSegDist, signedDistanceToPolygon, polygonCentroid,
+  polygonEdgeLengths, polylineSegmentLengths, pointAtDistance,
+} from "./lib/geometryUtils";
 import { hexSizeFromPaver, hexCorners, makeHexGrid, squareCorners, rectCorners, makeRectGrid } from "./lib/tileGrids";
 import { makeOrganicRoutedPath, makePatioBlob, sampleAlongPolyline, squarePolygonFromDrag, rectPolygonFromDrag, circlePolygonFromDrag } from "./lib/organicPaths";
+import { resizeSquareToSide, resizeRectToDims, resizeCircleToDiameter } from "./lib/shapeEdit";
 import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
 import { generateMeanderTracks, validatePathWidth } from "./lib/meanderTracks";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
@@ -52,7 +57,8 @@ export default function GardenPavingDesigner() {
   // --- garden boundary & exclusion (house) zones -- canvas starts empty; the user draws
   // (or resets to a default rectangle) rather than a shape being seeded for them ---
   const [gardenBoundary, setGardenBoundary] = useState([]);
-  const [exclusionZones, setExclusionZones] = useState([]); // [{id, label, poly}] -- house footprint etc.
+  const [boundaryShapeKind, setBoundaryShapeKind] = useState("rect"); // "rect" | "freeform" -- drives edge-length editing
+  const [exclusionZones, setExclusionZones] = useState([]); // [{id, label, poly, shapeKind}] -- house footprint etc.
 
   // --- anchors & connections (also empty by default) ---
   const [anchors, setAnchors] = useState([]);
@@ -386,15 +392,15 @@ export default function GardenPavingDesigner() {
   // ---- vector point editing: which polygons are selectable, and hit-testing against them ----
   const editablePolys = useMemo(() => {
     const list = [];
-    if (hasBoundary) list.push({ kind: "boundary", id: null, poly: gardenBoundary });
-    for (const z of exclusionZones) list.push({ kind: "exclusion", id: z.id, poly: z.poly });
+    if (hasBoundary) list.push({ kind: "boundary", id: null, poly: gardenBoundary, shapeKind: boundaryShapeKind });
+    for (const z of exclusionZones) list.push({ kind: "exclusion", id: z.id, poly: z.poly, shapeKind: z.shapeKind || "freeform" });
     for (const a of anchors) {
       if (a.type === "patio" && a.customPolygon && a.customPolygon.length >= 3) {
-        list.push({ kind: "patio", id: a.id, poly: a.customPolygon });
+        list.push({ kind: "patio", id: a.id, poly: a.customPolygon, shapeKind: a.shapeKind || "freeform" });
       }
     }
     return list;
-  }, [hasBoundary, gardenBoundary, exclusionZones, anchors]);
+  }, [hasBoundary, gardenBoundary, boundaryShapeKind, exclusionZones, anchors]);
 
   const findShapeNear = useCallback((pt, toleranceMm) => {
     let best = null, bestDist = Infinity;
@@ -409,6 +415,62 @@ export default function GardenPavingDesigner() {
     if (!selectedShape) return null;
     return editablePolys.find((s) => s.kind === selectedShape.kind && s.id === selectedShape.id) || null;
   }, [selectedShape, editablePolys]);
+
+  // ---- editable edge/diameter length labels for the selected shape -- how many labels and
+  // where they sit depends on shapeKind: one side for a square, two (width+height) for a
+  // rect, one diameter for a circle, every edge (including the closing one) for freeform ----
+  const lengthEditTargets = useMemo(() => {
+    if (!selectedShapeData) return [];
+    const { poly, shapeKind } = selectedShapeData;
+    if (poly.length < 2) return [];
+    if (shapeKind === "circle") {
+      const bbox = polygonBBox(poly);
+      const [cx] = polygonCentroid(poly);
+      const diameter = Math.max(bbox.xMax - bbox.xMin, bbox.yMax - bbox.yMin);
+      return [{ edgeIndex: null, x: cx, y: bbox.yMin, lengthMm: diameter }];
+    }
+    const lens = polygonEdgeLengths(poly);
+    const edgeTarget = (i) => {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      return { edgeIndex: i, x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, lengthMm: lens[i] };
+    };
+    if (shapeKind === "square") return [edgeTarget(0)];
+    if (shapeKind === "rect") return [edgeTarget(0), edgeTarget(1)];
+    return lens.map((_, i) => edgeTarget(i)); // freeform: every edge
+  }, [selectedShapeData]);
+
+  // writes a resized/reshaped polygon back to whichever state slice owns the selected shape
+  const setShapePolygon = useCallback((kind, id, newPoly) => {
+    const rounded = newPoly.map(([x, y]) => [Math.round(x), Math.round(y)]);
+    if (kind === "boundary") setGardenBoundary(rounded);
+    else if (kind === "exclusion") setExclusionZones((prev) => prev.map((z) => (z.id === id ? { ...z, poly: rounded } : z)));
+    else if (kind === "patio") {
+      setAnchors((prev) => prev.map((a) => {
+        if (a.id !== id) return a;
+        const [cx, cy] = polygonCentroid(rounded);
+        return { ...a, customPolygon: rounded, x: Math.round(cx), y: Math.round(cy) };
+      }));
+    }
+  }, []);
+
+  const commitLengthEdit = useCallback((target, newLenMm) => {
+    if (!selectedShapeData || !Number.isFinite(newLenMm) || newLenMm <= 0) return;
+    const { kind, id, poly, shapeKind } = selectedShapeData;
+    let newPoly;
+    if (shapeKind === "circle") newPoly = resizeCircleToDiameter(poly, newLenMm);
+    else if (shapeKind === "square") newPoly = resizeSquareToSide(poly, newLenMm);
+    else if (shapeKind === "rect") {
+      newPoly = target.edgeIndex === 0 ? resizeRectToDims(poly, newLenMm, null) : resizeRectToDims(poly, null, newLenMm);
+    } else {
+      // freeform: move just the "to" vertex of this one edge along its own direction, so
+      // editing one line's length doesn't disturb any other point
+      const n = poly.length;
+      const toIndex = (target.edgeIndex + 1) % n;
+      const newTo = pointAtDistance(poly[target.edgeIndex], poly[toIndex], newLenMm);
+      newPoly = poly.map((p, i) => (i === toIndex ? newTo : p));
+    }
+    setShapePolygon(kind, id, newPoly);
+  }, [selectedShapeData, setShapePolygon]);
 
   // ---- interactions: click-to-place, drag-to-move ----
   const FREEFORM_MODES = ["draw-patio", "draw-boundary", "draw-exclusion"];
@@ -444,31 +506,40 @@ export default function GardenPavingDesigner() {
     setPlaceMode(null);
   };
 
-  const addPatioFromPolygon = (poly) => {
-    if (!poly) return;
+  const addPatioFromPolygon = (poly, shapeKind = "freeform") => {
+    if (!poly) return null;
     const id = nextUid();
     const rounded = poly.map(([x, y]) => [Math.round(x), Math.round(y)]);
     const [cx, cy] = polygonCentroid(rounded);
-    setAnchors((prev) => [...prev, { id, label: `patio_${id}`, type: "patio", x: Math.round(cx), y: Math.round(cy), customPolygon: rounded }]);
+    setAnchors((prev) => [...prev, { id, label: `patio_${id}`, type: "patio", x: Math.round(cx), y: Math.round(cy), customPolygon: rounded, shapeKind }]);
+    return id;
   };
-  const addExclusionFromPolygon = (poly) => {
-    if (!poly) return;
+  const addExclusionFromPolygon = (poly, shapeKind = "freeform") => {
+    if (!poly) return null;
     const id = nextUid();
     const rounded = poly.map(([x, y]) => [Math.round(x), Math.round(y)]);
-    setExclusionZones((prev) => [...prev, { id, label: `house_${id}`, poly: rounded }]);
+    setExclusionZones((prev) => [...prev, { id, label: `house_${id}`, poly: rounded, shapeKind }]);
+    return id;
   };
 
   // finishes whatever freeform shape is currently being drawn, routing to the right target
   const finishFreeformDraw = () => {
     if (drawPoints.length < 3) return;
-    if (placeMode === "draw-patio") addPatioFromPolygon(drawPoints);
+    if (placeMode === "draw-patio") {
+      const newId = addPatioFromPolygon(drawPoints, "freeform");
+      if (newId) setSelectedShape({ kind: "patio", id: newId });
+    }
     else if (placeMode === "draw-boundary") {
       const rounded = drawPoints.map(([x, y]) => [Math.round(x), Math.round(y)]);
       setGardenBoundary(rounded);
-      setSelectedShape((s) => (s && s.kind === "boundary" ? null : s));
+      setBoundaryShapeKind("freeform");
+      setSelectedShape({ kind: "boundary", id: null });
       fitViewToPoints(rounded);
     }
-    else if (placeMode === "draw-exclusion") addExclusionFromPolygon(drawPoints);
+    else if (placeMode === "draw-exclusion") {
+      const newId = addExclusionFromPolygon(drawPoints, "freeform");
+      if (newId) setSelectedShape({ kind: "exclusion", id: newId });
+    }
     setDrawPoints([]);
     setPlaceMode(null);
   };
@@ -482,6 +553,7 @@ export default function GardenPavingDesigner() {
       [gardenW - marginMm, gardenH - marginMm], [marginMm, gardenH - marginMm],
     ];
     setGardenBoundary(rect);
+    setBoundaryShapeKind("rect");
     setSelectedShape((s) => (s && s.kind === "boundary" ? null : s));
     fitViewToPoints(rect);
   };
@@ -587,12 +659,18 @@ export default function GardenPavingDesigner() {
     if (dragId) { setDragId(null); return; }
     if (shapeDragStart && shapeDragCurrent) {
       let poly = null;
-      if (placeMode === "draw-square") poly = squarePolygonFromDrag(shapeDragStart, shapeDragCurrent);
-      else if (placeMode === "draw-rect") poly = rectPolygonFromDrag(shapeDragStart, shapeDragCurrent);
-      else if (placeMode === "draw-circle") poly = circlePolygonFromDrag(shapeDragStart, shapeDragCurrent);
-      else if (placeMode === "draw-exclusion-rect") poly = rectPolygonFromDrag(shapeDragStart, shapeDragCurrent);
-      if (placeMode === "draw-exclusion-rect") addExclusionFromPolygon(poly);
-      else addPatioFromPolygon(poly);
+      let shapeKind = null;
+      if (placeMode === "draw-square") { poly = squarePolygonFromDrag(shapeDragStart, shapeDragCurrent); shapeKind = "square"; }
+      else if (placeMode === "draw-rect") { poly = rectPolygonFromDrag(shapeDragStart, shapeDragCurrent); shapeKind = "rect"; }
+      else if (placeMode === "draw-circle") { poly = circlePolygonFromDrag(shapeDragStart, shapeDragCurrent); shapeKind = "circle"; }
+      else if (placeMode === "draw-exclusion-rect") { poly = rectPolygonFromDrag(shapeDragStart, shapeDragCurrent); shapeKind = "rect"; }
+      if (placeMode === "draw-exclusion-rect") {
+        const newId = addExclusionFromPolygon(poly, shapeKind);
+        if (newId) setSelectedShape({ kind: "exclusion", id: newId });
+      } else {
+        const newId = addPatioFromPolygon(poly, shapeKind);
+        if (newId) setSelectedShape({ kind: "patio", id: newId });
+      }
       setShapeDragStart(null);
       setShapeDragCurrent(null);
       setPlaceMode(null);
@@ -1024,6 +1102,36 @@ export default function GardenPavingDesigner() {
               </g>
             )}
 
+            {/* editable length labels for the selected shape -- one per side/diameter to
+                edit, depending on shapeKind (see lengthEditTargets); hidden mid vertex-drag
+                so the inputs don't fight with a live reshape */}
+            {selectedShapeData && !draggedVertex && lengthEditTargets.map((t, i) => (
+              <foreignObject
+                key={`${selectedShape.kind}-${selectedShape.id}-${i}`}
+                x={t.x - (LENGTH_INPUT_WIDTH_PX / 2) * mmPerPx}
+                y={t.y - (LENGTH_INPUT_HEIGHT_PX / 2) * mmPerPx}
+                width={LENGTH_INPUT_WIDTH_PX * mmPerPx}
+                height={LENGTH_INPUT_HEIGHT_PX * mmPerPx}
+                style={{ overflow: "visible" }}
+              >
+                <input
+                  type="number"
+                  defaultValue={Math.round(t.lengthMm)}
+                  key={Math.round(t.lengthMm)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+                  onBlur={(e) => commitLengthEdit(t, +e.target.value)}
+                  style={{
+                    width: "100%", height: "100%", boxSizing: "border-box", textAlign: "center",
+                    fontSize: `${LENGTH_LABEL_FONT_PX * mmPerPx}px`, fontFamily: "monospace",
+                    border: `${1 * mmPerPx}px solid ${ACCENT}`, borderRadius: `${4 * mmPerPx}px`,
+                    background: PAPER, color: INK, padding: 0,
+                  }}
+                />
+              </foreignObject>
+            ))}
+
             {FREEFORM_MODES.includes(placeMode) && drawPoints.length > 0 && (
               <g>
                 <polyline
@@ -1039,6 +1147,17 @@ export default function GardenPavingDesigner() {
                 {drawPoints.map((p, i) => (
                   <circle key={i} cx={p[0]} cy={p[1]} r={DRAW_POINT_R_MM} fill={ACCENT} stroke={PAPER} strokeWidth={DRAW_POINT_STROKE_MM} />
                 ))}
+                {/* live, read-only length of each line placed so far -- mouse is still busy
+                    clicking points, so editing happens later once the shape is selected */}
+                {polylineSegmentLengths(drawPoints).map((len, i) => {
+                  const a = drawPoints[i], b = drawPoints[i + 1];
+                  return (
+                    <text key={i} x={(a[0] + b[0]) / 2} y={(a[1] + b[1]) / 2 - LENGTH_LABEL_FONT_PX * mmPerPx}
+                      fontSize={LENGTH_LABEL_FONT_PX * mmPerPx} fill={ACCENT} textAnchor="middle" style={{ userSelect: "none" }}>
+                      {Math.round(len)}
+                    </text>
+                  );
+                })}
               </g>
             )}
 
@@ -1047,10 +1166,38 @@ export default function GardenPavingDesigner() {
               if (placeMode === "draw-square") preview = squarePolygonFromDrag(shapeDragStart, shapeDragCurrent);
               else if (placeMode === "draw-rect") preview = rectPolygonFromDrag(shapeDragStart, shapeDragCurrent);
               else if (placeMode === "draw-circle") preview = circlePolygonFromDrag(shapeDragStart, shapeDragCurrent);
+              else if (placeMode === "draw-exclusion-rect") preview = rectPolygonFromDrag(shapeDragStart, shapeDragCurrent);
               if (!preview) return null;
+              // live, read-only dimension label(s) -- mouse button is still down, so precise
+              // numeric editing only becomes available once the shape is finished and selected
+              let labels = [];
+              if (placeMode === "draw-square") {
+                const lens = polygonEdgeLengths(preview);
+                const a = preview[0], b = preview[1];
+                labels = [{ x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, len: lens[0] }];
+              } else if (placeMode === "draw-rect" || placeMode === "draw-exclusion-rect") {
+                const lens = polygonEdgeLengths(preview);
+                const w0 = preview[0], w1 = preview[1], h0 = preview[1], h1 = preview[2];
+                labels = [
+                  { x: (w0[0] + w1[0]) / 2, y: (w0[1] + w1[1]) / 2, len: lens[0] },
+                  { x: (h0[0] + h1[0]) / 2, y: (h0[1] + h1[1]) / 2, len: lens[1] },
+                ];
+              } else if (placeMode === "draw-circle") {
+                const bbox = polygonBBox(preview);
+                const [cx] = polygonCentroid(preview);
+                labels = [{ x: cx, y: bbox.yMin, len: bbox.xMax - bbox.xMin }];
+              }
               return (
-                <polygon points={preview.map((p) => p.join(",")).join(" ")}
-                  fill={ACCENT} opacity={0.16} stroke={ACCENT} strokeWidth={DRAW_PREVIEW_STROKE_MM} strokeDasharray="14,8" />
+                <g>
+                  <polygon points={preview.map((p) => p.join(",")).join(" ")}
+                    fill={ACCENT} opacity={0.16} stroke={ACCENT} strokeWidth={DRAW_PREVIEW_STROKE_MM} strokeDasharray="14,8" />
+                  {labels.map((l, i) => (
+                    <text key={i} x={l.x} y={l.y - LENGTH_LABEL_FONT_PX * mmPerPx}
+                      fontSize={LENGTH_LABEL_FONT_PX * mmPerPx} fill={ACCENT} textAnchor="middle" style={{ userSelect: "none" }}>
+                      {Math.round(l.len)}
+                    </text>
+                  ))}
+                </g>
               );
             })()}
 
