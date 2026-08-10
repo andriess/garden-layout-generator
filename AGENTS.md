@@ -2,8 +2,8 @@
 
 ## What this is
 Client-only React + Vite SPA for designing garden paving layouts (hex/square/rectangle
-tile grids, Voronoi material zones, boundary-aware organic paths, A*-routed meander
-tracks that avoid house/exclusion polygons). No backend, no persistence, no tests.
+tile grids, Voronoi material zones, boundary-aware organic paths, user-placed meander
+tracks routed the same way). No backend, no persistence, no tests.
 
 ## Commands
 ```bash
@@ -23,20 +23,20 @@ package.json) — don't assume one exists or invent a command for it.
   algorithm changes.
 - `src/lib/` — pure logic, no React/JSX, imports flow one direction (leaf → dependent):
   - `geometryUtils.js` — leaf module: `mulberry32`/`gaussian` RNG, `polygonBBox`,
-    `pointInPoly`, `pointSegDist`, `signedDistanceToPolygon`, `polygonCentroid`,
-    `segmentsIntersect`. Everything else in `src/lib/` depends on this.
+    `pointInPoly`, `pointSegDist`, `closestPointOnPolyline`, `signedDistanceToPolygon`,
+    `polygonCentroid`, `segmentsIntersect`. Everything else in `src/lib/` depends on this.
   - `constants.js` — theme colors (`PALETTE`, `INK`, `ACCENT`, etc.) and path-width
     constants (`MIN_PEDESTRIAN_WIDTH_MM`, `MIN_TILES_ACROSS`).
   - `tileGrids.js` — hex/square/rectangle tile grid generation (`makeHexGrid`,
     `makeRectGrid`, `hexCorners`, `rectCorners`, ...).
   - `organicPaths.js` — Catmull-Rom smoothing, boundary-aware wobble
-    (`makeOrganicPath`), obstacle-avoiding routing (`makeOrganicRoutedPath`), patio blobs
-    (`makePatioBlob`), and drag-to-shape presets (`squarePolygonFromDrag`,
-    `rectPolygonFromDrag`, `circlePolygonFromDrag`).
+    (`makeOrganicPath`), obstacle-avoiding routing (`makeOrganicRoutedPath`), chaining that
+    routing across a hand-placed waypoint chain (`makeOrganicMultiWaypointPath`, used for
+    meander tracks), snapping a point onto the nearest path/patio (`snapToPathOrPatio`),
+    patio blobs (`makePatioBlob`), path-width clamping (`validatePathWidth`), and
+    drag-to-shape presets (`squarePolygonFromDrag`, `rectPolygonFromDrag`,
+    `circlePolygonFromDrag`).
   - `voronoiZones.js` — bounded Voronoi polygons + Lloyd relaxation via `d3-delaunay`.
-  - `meanderTracks.js` — clearance-grid A* search for meander (desire) tracks
-    (`generateMeanderTracks`) and `validatePathWidth`; depends on `catmullRom` from
-    `organicPaths.js`.
 - `src/components/ui.jsx` — small presentational subcomponents (`Section`, `Row`, `Stat`,
   `Toggle`, `ShapeButton`, `PlaceButton`, `NumInput`) plus shared inline-style constants
   (`selectStyle`, `tinyInputStyle`, `iconBtnStyle`, `primaryBtnStyle`).
