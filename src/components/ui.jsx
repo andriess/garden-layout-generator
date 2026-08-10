@@ -97,7 +97,10 @@ function RadialMenuButton({ mmPerPx, offsetXPx, x, y, danger, icon, onClick }) {
 // connect flow from this anchor) and Delete. Positioned by an mm-space point + mmPerPx,
 // same "fixed on-screen size" trick as the length-edit inputs in App.jsx.
 export function AnchorRadialMenu({ x, y, mmPerPx, onLink, onDelete }) {
-  const iconPx = ANCHOR_MENU_ICON_PX;
+  // lucide's `size` prop becomes a raw SVG width/height inside the foreignObject, which is
+  // itself subject to the ambient mm-per-px transform -- scale it explicitly (same as the
+  // border/shadow/font-size below) so the icon stays a fixed on-screen size at any zoom.
+  const iconPx = ANCHOR_MENU_ICON_PX * mmPerPx;
   return (
     <g>
       <RadialMenuButton mmPerPx={mmPerPx} x={x} y={y} offsetXPx={-ANCHOR_MENU_OFFSET_X_PX}
