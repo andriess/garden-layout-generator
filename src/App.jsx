@@ -423,6 +423,14 @@ export default function GardenPavingDesigner() {
       setSelectedShape(hit ? { kind: hit.kind, id: hit.id } : null);
       return;
     }
+    if (placeMode === "connect") {
+      // connect tool is click-to-select-source, click-to-select-target -- clicking
+      // empty canvas (i.e. not on an anchor, which stops propagation before this fires)
+      // cancels whichever anchor is currently selected as the connection source
+      setConnectFromId(null);
+      setConnectPreviewPoint(null);
+      return;
+    }
     const [x, y] = svgPointFromEvent(evt);
     if (FREEFORM_MODES.includes(placeMode)) {
       setDrawPoints((prev) => [...prev, [Math.round(x), Math.round(y)]]);
@@ -496,25 +504,30 @@ export default function GardenPavingDesigner() {
 
   const handleAnchorPointerDown = (id) => (evt) => {
     evt.stopPropagation();
-    if (placeMode === "connect") {
+    if (placeMode === "connect") return; // connect tool is click-driven, see handleAnchorClick
+    setDragId(id);
+  };
+  // click on an anchor while the connect tool is active: first click selects the source
+  // anchor, a second click on a *different* anchor commits the connection, and clicking
+  // the same anchor again cancels the selection.
+  const handleAnchorClick = (id) => (evt) => {
+    if (placeMode !== "connect") return;
+    evt.stopPropagation();
+    if (!connectFromId) {
       setConnectFromId(id);
       const a = anchorById[id];
       if (a) setConnectPreviewPoint([a.x, a.y]);
       return;
     }
-    setDragId(id);
-  };
-  // mouseup on a *specific* anchor -- only meaningful while a connect-drag is in flight,
-  // and only if it lands on a different anchor than the one the drag started from.
-  const handleAnchorPointerUp = (id) => (evt) => {
-    if (!connectFromId) return;
-    evt.stopPropagation();
-    if (id !== connectFromId) {
-      const already = connections.some(
-        (c) => (c.a === connectFromId && c.b === id) || (c.a === id && c.b === connectFromId)
-      );
-      if (!already) setConnections((prev) => [...prev, { a: connectFromId, b: id, widthMm: connWidth }]);
+    if (id === connectFromId) {
+      setConnectFromId(null);
+      setConnectPreviewPoint(null);
+      return;
     }
+    const already = connections.some(
+      (c) => (c.a === connectFromId && c.b === id) || (c.a === id && c.b === connectFromId)
+    );
+    if (!already) setConnections((prev) => [...prev, { a: connectFromId, b: id, widthMm: connWidth }]);
     setConnectFromId(null);
     setConnectPreviewPoint(null);
   };
@@ -564,12 +577,6 @@ export default function GardenPavingDesigner() {
     if (isPanning) { setIsPanning(false); panLastRef.current = null; return; }
     if (draggedVertex) { setDraggedVertex(null); return; }
     if (dragId) { setDragId(null); return; }
-    if (connectFromId) {
-      // released over empty canvas (not on another anchor) -- abandon the connect-drag
-      setConnectFromId(null);
-      setConnectPreviewPoint(null);
-      return;
-    }
     if (shapeDragStart && shapeDragCurrent) {
       let poly = null;
       if (placeMode === "draw-square") poly = squarePolygonFromDrag(shapeDragStart, shapeDragCurrent);
@@ -793,14 +800,14 @@ export default function GardenPavingDesigner() {
               active={placeMode === "connect"}
               onClick={() => setPlaceMode(placeMode === "connect" ? null : "connect")}
               icon={<Link2 size={13} />}
-              label="Connect anchors (drag)"
+              label="Connect anchors"
               fullWidth
             />
             {placeMode === "connect" && (
               <div style={{ fontSize: 11, color: ACCENT, marginTop: 6 }}>
                 {connectFromId
-                  ? "Drag to another anchor and release to connect."
-                  : "Click and drag from an anchor to another anchor on the canvas."}
+                  ? "Click another anchor to connect (or click it again to cancel)."
+                  : "Click an anchor to start a connection."}
               </div>
             )}
           </div>
@@ -1051,7 +1058,7 @@ export default function GardenPavingDesigner() {
               <g
                 key={a.id}
                 onMouseDown={handleAnchorPointerDown(a.id)}
-                onMouseUp={handleAnchorPointerUp(a.id)}
+                onClick={handleAnchorClick(a.id)}
                 style={{ cursor: placeMode === "connect" ? "crosshair" : "grab" }}
               >
                 {connectFromId === a.id && (
