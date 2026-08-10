@@ -163,29 +163,82 @@ function pocketCellIndices(pocketLabels, pocketId) {
   for (let i = 0; i < pocketLabels.length; i++) if (pocketLabels[i] === pocketId) out.push(i);
   return out;
 }
-function pickWanderWaypoint(grid, pocketCells, aPos, bPos, rng, excludeMm = 700) {
-  // Deliberately routes THROUGH one of the most open cells in the shared pocket, rather than
-  // merely discounting the cost of cells near it -- a soft cost nudge still lets total path
-  // length dominate the decision (that's exactly what produced the disappointing ~15% detours
-  // before). Picking an explicit waypoint and then pathfinding TO it removes length from the
-  // decision of *whether* to detour entirely; length only still matters for how each leg gets
-  // there, which is fine -- it should still be a walkable route, not a random line.
-  const { cellCenter, cols, openness } = grid;
-  const ranked = [];
+function cellsNearRoute(grid, pocketCells, aPos, bPos, padMm) {
+  // Restricts a pocket's cells to the neighbourhood actually relevant to THIS a->b route --
+  // without this, "how much open space is there" ends up measuring the entire connected
+  // void (which, in an open garden, can be most of it), and a peak can end up clean across
+  // the far side of the plot from either endpoint. Padding scales with the direct distance
+  // so short hops still get some room to bulge, without unrelated open space elsewhere in a
+  // large pocket pulling the route way off course.
+  const { cellCenter, cols } = grid;
+  const xMin = Math.min(aPos[0], bPos[0]) - padMm, xMax = Math.max(aPos[0], bPos[0]) + padMm;
+  const yMin = Math.min(aPos[1], bPos[1]) - padMm, yMax = Math.max(aPos[1], bPos[1]) + padMm;
+  const out = [];
   for (const i of pocketCells) {
-    const r = Math.floor(i / cols), c = i % cols;
-    const p = cellCenter(c, r);
-    if (Math.hypot(p[0] - aPos[0], p[1] - aPos[1]) < excludeMm) continue;
-    if (Math.hypot(p[0] - bPos[0], p[1] - bPos[1]) < excludeMm) continue;
-    ranked.push([p, openness[i]]);
+    const p = cellCenter(i % cols, Math.floor(i / cols));
+    if (p[0] >= xMin && p[0] <= xMax && p[1] >= yMin && p[1] <= yMax) out.push(i);
   }
-  if (ranked.length === 0) return null;
-  ranked.sort((x, y) => y[1] - x[1]);
-  // top-N by openness, not just the single global peak -- keeps repeated tracks through the
-  // same pocket from all converging on the exact same point, and the peak itself might be a
-  // single-cell fluke; any of these is genuinely "the open part of the pocket".
-  const top = ranked.slice(0, Math.min(8, ranked.length));
-  return top[Math.floor(rng() * top.length)][0];
+  return out;
+}
+function pocketOpenAreaMm2(pocketCells, cellMm) {
+  return pocketCells.length * cellMm * cellMm;
+}
+function pocketWaypointBudget(pocketCells, cellMm) {
+  // How many distinct open areas is this (route-local) pocket worth wandering through, going
+  // purely off its measured size? One "visit" per ~12 m^2 of open space beyond the first,
+  // capped so a single track doesn't turn into a grand tour. A tight nook still gets its one
+  // waypoint; a broad lawn gets several.
+  const areaM2 = pocketOpenAreaMm2(pocketCells, cellMm) / 1e6;
+  return Math.max(1, Math.min(4, 1 + Math.floor(areaM2 / 12)));
+}
+function findPocketPeaks(grid, pocketCells, minOpennessMm, maxPeaks) {
+  // Non-max-suppression over the pocket's openness field: repeatedly take the most-open
+  // remaining cell as a peak, then suppress every other candidate within roughly that peak's
+  // own reach (how far it sits from the nearest obstacle) before considering the next one.
+  // This is what finds one representative point per genuinely separate wide area instead of
+  // a cluster of near-duplicate points all sitting in the same single blob -- i.e. it's the
+  // actual "how much distinct open space is there" measurement, not just a top-N sort.
+  const { cellCenter, cols, openness } = grid;
+  const candidates = [];
+  for (const i of pocketCells) {
+    const o = openness[i];
+    if (o < minOpennessMm) continue;
+    candidates.push({ pos: cellCenter(i % cols, Math.floor(i / cols)), openness: o });
+  }
+  candidates.sort((a, b) => b.openness - a.openness);
+  const peaks = [];
+  for (const cand of candidates) {
+    if (peaks.length >= maxPeaks) break;
+    const tooClose = peaks.some((peak) => {
+      const suppressRadius = Math.max(peak.openness, cand.openness) * 1.4;
+      return Math.hypot(cand.pos[0] - peak.pos[0], cand.pos[1] - peak.pos[1]) < suppressRadius;
+    });
+    if (!tooClose) peaks.push(cand);
+  }
+  return peaks;
+}
+function pickWanderWaypoints(grid, pocketCells, aPos, bPos, rng, { excludeMm = 700, minOpennessMm, maxWaypoints }) {
+  // Deliberately routes THROUGH the most open areas of the shared pocket, rather than merely
+  // discounting the cost of cells near them -- a soft cost nudge still lets total path length
+  // dominate the decision (that's exactly what produced the disappointing ~15% detours before
+  // this). Picking explicit waypoints and pathfinding TO them removes length from the decision
+  // of *whether* to detour entirely; length only still matters for how each leg gets there.
+  const peaks = findPocketPeaks(grid, pocketCells, minOpennessMm, maxWaypoints + 2);
+  const dirX = bPos[0] - aPos[0], dirY = bPos[1] - aPos[1];
+  const filtered = peaks.filter((p) => {
+    if (Math.hypot(p.pos[0] - aPos[0], p.pos[1] - aPos[1]) < excludeMm) return false;
+    if (Math.hypot(p.pos[0] - bPos[0], p.pos[1] - bPos[1]) < excludeMm) return false;
+    return true;
+  });
+  if (filtered.length === 0) return [];
+  // order along the a->b direction (signed projection onto that axis) so a multi-waypoint
+  // route advances from a to b, rather than doubling back and forth between visits
+  filtered.sort((p, q) => {
+    const pp = (p.pos[0] - aPos[0]) * dirX + (p.pos[1] - aPos[1]) * dirY;
+    const qq = (q.pos[0] - aPos[0]) * dirX + (q.pos[1] - aPos[1]) * dirY;
+    return pp - qq;
+  });
+  return filtered.slice(0, maxWaypoints).map((p) => p.pos);
 }
 function nearestSafeCell(grid, p) {
   const { cols, rows, cellMm, bbox, safe, idx } = grid;
@@ -446,18 +499,33 @@ export function generateMeanderTracks({ anchors, connections, mainPathPolys, pat
       const d = Math.hypot(c1.pos[0] - c2.pos[0], c1.pos[1] - c2.pos[1]);
       if (d < 800 || d > 7000) continue;
       if (endpointsTooSimilar(c1.pos, c2.pos, usedPairs, minEndpointReuseSepMm)) continue;
-      // Route THROUGH the pocket's open middle whenever one is worth visiting -- this is the
-      // actual "wandering" mechanic (see pickWanderWaypoint), not a length trade-off. Only
-      // falls back to a direct route if no qualifying waypoint exists (tiny/uniform pocket)
-      // or a leg genuinely can't be found.
+      // Route THROUGH the pocket's open areas whenever there are any worth visiting -- the
+      // actual "wandering" mechanic (see pickWanderWaypoints), not a length trade-off. How
+      // many stops depends on how much distinct open space this pocket actually measures out
+      // to (pocketWaypointBudget), not a fixed number. Falls back to a direct route only if no
+      // qualifying waypoint exists (tiny/uniform pocket) or a leg genuinely can't be found.
       let raw = null;
       if (rng() < wanderProb) {
         const pocketCells = pocketCellIndices(pocketLabels, Number(pocketId));
-        const waypoint = pickWanderWaypoint(grid, pocketCells, c1.pos, c2.pos, rng);
-        if (waypoint) {
-          const leg1 = aStarSearch(grid, c1.pos, waypoint, openSpaceBiasTargetMm, openSpaceBiasStrength);
-          const leg2 = aStarSearch(grid, waypoint, c2.pos, openSpaceBiasTargetMm, openSpaceBiasStrength);
-          if (leg1 && leg2) raw = leg1.concat(leg2.slice(1));
+        const routePadMm = Math.max(2000, d * 0.75);
+        const localCells = cellsNearRoute(grid, pocketCells, c1.pos, c2.pos, routePadMm);
+        const maxWaypoints = pocketWaypointBudget(localCells, cellMm);
+        const waypoints = pickWanderWaypoints(grid, localCells, c1.pos, c2.pos, rng, {
+          minOpennessMm: openSpaceBiasTargetMm * 0.6,
+          maxWaypoints,
+        });
+        if (waypoints.length > 0) {
+          const stops = [c1.pos, ...waypoints, c2.pos];
+          const legs = [];
+          for (let i = 0; i < stops.length - 1; i++) {
+            const leg = aStarSearch(grid, stops[i], stops[i + 1], openSpaceBiasTargetMm, openSpaceBiasStrength);
+            if (!leg) { legs.length = 0; break; }
+            legs.push(leg);
+          }
+          if (legs.length === stops.length - 1) {
+            raw = legs[0];
+            for (let i = 1; i < legs.length; i++) raw = raw.concat(legs[i].slice(1));
+          }
         }
       }
       if (!raw) raw = aStarSearch(grid, c1.pos, c2.pos, openSpaceBiasTargetMm, openSpaceBiasStrength);
