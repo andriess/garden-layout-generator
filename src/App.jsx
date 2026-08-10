@@ -26,7 +26,7 @@ import { resizeSquareToSide, resizeRectToDims, resizeCircleToDiameter } from "./
 import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
 import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, migrateDesignPayload, validateImportPayload, maxIdSuffix } from "./lib/persistence";
-import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
+import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, WaypointRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
 
 // ============================================================
 // Main component
@@ -87,6 +87,8 @@ export default function GardenPavingDesigner() {
   const [connectPreviewPoint, setConnectPreviewPoint] = useState(null);
   // click an anchor (idle mode) to open a small radial menu next to it: Link / Delete
   const [anchorMenuId, setAnchorMenuId] = useState(null);
+  // click a meander waypoint (idle mode, track selected) to open a delete-only radial menu
+  const [waypointMenu, setWaypointMenu] = useState(null); // { meanderId, index } | null
 
   // --- vector point editing: select a drawn polygon (boundary / exclusion zone / custom
   // patio shape) by clicking its outline, then drag its vertex handles to reshape it ---
@@ -177,7 +179,7 @@ export default function GardenPavingDesigner() {
   useEffect(() => {
     const isEditable = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT");
     const onKeyDown = (e) => {
-      if (e.key === "Escape") setAnchorMenuId(null);
+      if (e.key === "Escape") { setAnchorMenuId(null); setWaypointMenu(null); }
       if (e.code === "Space" && !isEditable(document.activeElement)) {
         e.preventDefault();
         setSpaceHeld(true);
@@ -505,6 +507,7 @@ export default function GardenPavingDesigner() {
       const meanderHit = !hit ? findMeanderNear([x, y], HIT_TOLERANCE_PX * mmPerPx) : null;
       setSelectedShape(hit ? { kind: hit.kind, id: hit.id } : meanderHit ? { kind: "meander", id: meanderHit.id } : null);
       setAnchorMenuId(null);
+      setWaypointMenu(null);
       return;
     }
     if (placeMode === "connect") {
@@ -582,6 +585,28 @@ export default function GardenPavingDesigner() {
   const removeMeanderPath = (id) => {
     setMeanderPaths((prev) => prev.filter((m) => m.id !== id));
     setSelectedShape((s) => (s && s.kind === "meander" && s.id === id ? null : s));
+    setWaypointMenu((w) => (w && w.meanderId === id ? null : w));
+  };
+  // deletes a single waypoint from a meander track; if that leaves fewer than 2 waypoints
+  // the whole track is removed instead (mirrors finishFreeformDraw's >=2-point invariant).
+  // deleting an endpoint re-snaps the new endpoint onto the nearest path/patio, same as
+  // dragging one does in handlePointerMove.
+  const removeWaypoint = (meanderId, index) => {
+    setWaypointMenu(null);
+    const m = meanderPaths.find((mp) => mp.id === meanderId);
+    if (!m) return;
+    if (m.waypoints.length <= 2) {
+      removeMeanderPath(meanderId);
+      return;
+    }
+    const isEndpoint = index === 0 || index === m.waypoints.length - 1;
+    const nextWaypoints = m.waypoints.filter((_, i) => i !== index);
+    if (isEndpoint) {
+      const endIdx = index === 0 ? 0 : nextWaypoints.length - 1;
+      const [sx, sy] = snapToPathOrPatio(nextWaypoints[endIdx], pathPolys, patioBlobs.map((b) => b.poly));
+      nextWaypoints[endIdx] = [Math.round(sx), Math.round(sy)];
+    }
+    setMeanderPaths((prev) => prev.map((mp) => (mp.id === meanderId ? { ...mp, waypoints: nextWaypoints } : mp)));
   };
   const cancelFreeformDraw = () => {
     setDrawPoints([]);
@@ -654,7 +679,15 @@ export default function GardenPavingDesigner() {
   // vertex handle drag -- reshapes whichever polygon is currently selected
   const handleVertexPointerDown = (kind, id, index) => (evt) => {
     evt.stopPropagation();
+    setWaypointMenu(null); // a drag supersedes any open waypoint radial menu
     setDraggedVertex({ kind, id, index });
+  };
+  // click on a meander waypoint handle: opens/closes a delete-only radial menu next to it
+  const handleWaypointClick = (meanderId, index) => (evt) => {
+    evt.stopPropagation();
+    setWaypointMenu((prev) =>
+      prev && prev.meanderId === meanderId && prev.index === index ? null : { meanderId, index }
+    );
   };
   const handlePointerMove = (evt) => {
     if (isPanning && panLastRef.current) {
@@ -1389,8 +1422,18 @@ export default function GardenPavingDesigner() {
                     <circle key={i} cx={p[0]} cy={p[1]} r={HANDLE_RADIUS_PX * mmPerPx}
                       fill={PAPER} stroke={ACCENT} strokeWidth={HANDLE_STROKE_PX * mmPerPx}
                       onMouseDown={handleVertexPointerDown("meander", m.id, i)}
+                      onClick={handleWaypointClick(m.id, i)}
                       style={{ cursor: "grab" }} />
                   ))}
+                  {/* delete-only radial menu -- opened by clicking a waypoint handle above */}
+                  {!placeMode && waypointMenu && waypointMenu.meanderId === m.id && m.waypoints[waypointMenu.index] && (
+                    <WaypointRadialMenu
+                      x={m.waypoints[waypointMenu.index][0]}
+                      y={m.waypoints[waypointMenu.index][1]}
+                      mmPerPx={mmPerPx}
+                      onDelete={() => removeWaypoint(m.id, waypointMenu.index)}
+                    />
+                  )}
                 </g>
               );
             })()}

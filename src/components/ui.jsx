@@ -111,6 +111,19 @@ export function AnchorRadialMenu({ x, y, mmPerPx, onLink, onDelete }) {
   );
 }
 
+// Radial menu shown next to a meander waypoint after clicking it (idle mode, track already
+// selected): delete-only, same button/positioning as AnchorRadialMenu but centered above
+// the point since there's only one action.
+export function WaypointRadialMenu({ x, y, mmPerPx, onDelete }) {
+  const iconPx = ANCHOR_MENU_ICON_PX * mmPerPx;
+  return (
+    <g>
+      <RadialMenuButton mmPerPx={mmPerPx} x={x} y={y} offsetXPx={0}
+        danger icon={<Trash2 size={iconPx} />} onClick={onDelete} />
+    </g>
+  );
+}
+
 export const selectStyle = { padding: "5px 6px", fontSize: 11.5, border: `1px solid ${PANEL_BORDER}`, borderRadius: 4, background: PAPER, color: INK };
 export const tinyInputStyle = { padding: "2px 5px", fontSize: 11, border: `1px solid ${PANEL_BORDER}`, borderRadius: 3, background: PAPER, color: INK };
 export const iconBtnStyle = { border: "none", background: "none", cursor: "pointer", color: INK_SOFT, padding: 2, display: "flex" };
