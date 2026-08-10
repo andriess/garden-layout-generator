@@ -129,15 +129,25 @@ function segmentCrossesPolygon(p1, p2, poly) {
   const mid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
   return pointInPoly(mid, poly); // catches a diagonal that passes fully through without crossing an edge
 }
-function segmentStaysInBoundary(a, b, boundaryPoly, clearanceMm, samples = 8) {
+function segmentStaysInBoundary(a, b, boundaryPoly, clearanceMm, samples = 8, exemptPts = []) {
   // sampled, not analytic -- but that's the same trade-off segmentClearsObstacles makes in
   // meanderTracks.js for the identical reason: an exact "segment vs. concave polygon with
   // clearance" solve isn't worth the complexity here, and dense enough sampling along paths
   // this short (a handful of metres) can't miss a boundary crossing that matters visually.
+  //
+  // exemptPts are real anchors (doors/patios) the route has to touch, which can legitimately
+  // sit closer to the boundary than clearanceMm (a door IS at the wall) -- near one of them,
+  // only require staying inside the polygon at all, not the full clearance; a couple of
+  // boundaryClearanceMm past the anchor the ordinary full-clearance rule takes back over.
+  // EPS absorbs float noise from insetReflexVertices' waypoints, which sit at *exactly*
+  // clearanceMm from the boundary by construction and can land a hair under it either way.
+  const EPS = 1e-3;
   for (let s = 0; s <= samples; s++) {
     const t = s / samples;
     const p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
-    if (signedDistanceToPolygon(p, boundaryPoly) < clearanceMm) return false;
+    const nearAnchor = exemptPts.some((e) => Math.hypot(p[0] - e[0], p[1] - e[1]) < clearanceMm);
+    const required = nearAnchor ? 0 : clearanceMm;
+    if (signedDistanceToPolygon(p, boundaryPoly) < required - EPS) return false;
   }
   return true;
 }
@@ -192,8 +202,8 @@ function insetReflexVertices(boundaryPoly, insetMm) {
     return out;
   });
 }
-function edgeIsClear(a, b, boundaryPoly, boundaryClearanceMm, exclusionPolysInflated) {
-  if (!segmentStaysInBoundary(a, b, boundaryPoly, boundaryClearanceMm)) return false;
+function edgeIsClear(a, b, boundaryPoly, boundaryClearanceMm, exclusionPolysInflated, exemptPts = []) {
+  if (!segmentStaysInBoundary(a, b, boundaryPoly, boundaryClearanceMm, 8, exemptPts)) return false;
   return !exclusionPolysInflated.some((poly) => segmentCrossesPolygon(a, b, poly));
 }
 // Generalizes the old exclusion-only router: the routing domain is now "inside boundaryPoly
@@ -203,14 +213,18 @@ function edgeIsClear(a, b, boundaryPoly, boundaryClearanceMm, exclusionPolysInfl
 // every reflex boundary vertex (inset inward here) -- exactly the corners a shortest path
 // through this domain could ever need to touch.
 function routeWithinBoundary(start, end, boundaryPoly, exclusionPolysInflated, boundaryClearanceMm) {
-  if (edgeIsClear(start, end, boundaryPoly, boundaryClearanceMm, exclusionPolysInflated)) return [start, end];
+  // start/end are the real anchors (doors/patios) this route must touch -- exempt them (and
+  // only them, not the router's own inset/exclusion waypoints) from the full clearance
+  // requirement near their own position; see segmentStaysInBoundary.
+  const anchorExempt = [start, end];
+  if (edgeIsClear(start, end, boundaryPoly, boundaryClearanceMm, exclusionPolysInflated, anchorExempt)) return [start, end];
   const reflexPts = insetReflexVertices(boundaryPoly, boundaryClearanceMm);
   if (reflexPts.length === 0 && exclusionPolysInflated.length === 0) return [start, end]; // nothing to route around
 
   const nodes = [start, end, ...reflexPts];
   exclusionPolysInflated.forEach((poly) => poly.forEach((v) => nodes.push(v)));
   const n = nodes.length;
-  const clear = (i, j) => edgeIsClear(nodes[i], nodes[j], boundaryPoly, boundaryClearanceMm, exclusionPolysInflated);
+  const clear = (i, j) => edgeIsClear(nodes[i], nodes[j], boundaryPoly, boundaryClearanceMm, exclusionPolysInflated, anchorExempt);
 
   const adj = Array.from({ length: n }, () => []);
   for (let i = 0; i < n; i++) {
