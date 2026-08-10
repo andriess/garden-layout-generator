@@ -1,6 +1,6 @@
-import React, { useState, useMemo, useRef, useCallback } from "react";
+import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { Delaunay } from "d3-delaunay";
-import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square, Link2 } from "lucide-react";
 
 // ============================================================
 // Palette -- carried over from the earlier static-render prototype
@@ -873,6 +873,10 @@ export default function GardenPavingDesigner() {
   const [connFrom, setConnFrom] = useState("");
   const [connTo, setConnTo] = useState("");
   const [connWidth, setConnWidth] = useState(400);
+  // click-and-drag connect tool: mousedown on an anchor while placeMode === "connect"
+  // starts a rubber-band line; releasing over a *different* anchor commits a connection.
+  const [connectFromId, setConnectFromId] = useState(null);
+  const [connectPreviewPoint, setConnectPreviewPoint] = useState(null);
 
   // --- forks: branch off an existing path at a point, to another anchor ---
   const [forkOnConn, setForkOnConn] = useState(0); // index into connections
@@ -906,6 +910,14 @@ export default function GardenPavingDesigner() {
   const [showPlanting, setShowPlanting] = useState(true);
 
   const svgRef = useRef(null);
+
+  // leaving the connect tool (switching to any other tool) should abandon an in-progress drag
+  useEffect(() => {
+    if (placeMode !== "connect") {
+      setConnectFromId(null);
+      setConnectPreviewPoint(null);
+    }
+  }, [placeMode]);
 
   const boundaryBBox = useMemo(() => polygonBBox(gardenBoundary), [gardenBoundary]);
 
@@ -1140,7 +1152,27 @@ export default function GardenPavingDesigner() {
 
   const handleAnchorPointerDown = (id) => (evt) => {
     evt.stopPropagation();
+    if (placeMode === "connect") {
+      setConnectFromId(id);
+      const a = anchorById[id];
+      if (a) setConnectPreviewPoint([a.x, a.y]);
+      return;
+    }
     setDragId(id);
+  };
+  // mouseup on a *specific* anchor -- only meaningful while a connect-drag is in flight,
+  // and only if it lands on a different anchor than the one the drag started from.
+  const handleAnchorPointerUp = (id) => (evt) => {
+    if (!connectFromId) return;
+    evt.stopPropagation();
+    if (id !== connectFromId) {
+      const already = connections.some(
+        (c) => (c.a === connectFromId && c.b === id) || (c.a === id && c.b === connectFromId)
+      );
+      if (!already) setConnections((prev) => [...prev, { a: connectFromId, b: id, widthMm: connWidth }]);
+    }
+    setConnectFromId(null);
+    setConnectPreviewPoint(null);
   };
   const handlePointerMove = (evt) => {
     if (dragId) {
@@ -1148,10 +1180,20 @@ export default function GardenPavingDesigner() {
       setAnchors((prev) => prev.map((a) => (a.id === dragId ? { ...a, x: Math.round(x), y: Math.round(y) } : a)));
       return;
     }
+    if (connectFromId) {
+      setConnectPreviewPoint(svgPointFromEvent(evt));
+      return;
+    }
     if (shapeDragStart) setShapeDragCurrent(svgPointFromEvent(evt));
   };
   const handlePointerUp = () => {
     if (dragId) { setDragId(null); return; }
+    if (connectFromId) {
+      // released over empty canvas (not on another anchor) -- abandon the connect-drag
+      setConnectFromId(null);
+      setConnectPreviewPoint(null);
+      return;
+    }
     if (shapeDragStart && shapeDragCurrent) {
       let poly = null;
       if (placeMode === "draw-square") poly = squarePolygonFromDrag(shapeDragStart, shapeDragCurrent);
@@ -1361,6 +1403,22 @@ export default function GardenPavingDesigner() {
         </Section>
 
         <Section title="Paths">
+          <div style={{ marginBottom: 10 }}>
+            <PlaceButton
+              active={placeMode === "connect"}
+              onClick={() => setPlaceMode(placeMode === "connect" ? null : "connect")}
+              icon={<Link2 size={13} />}
+              label="Connect anchors (drag)"
+              fullWidth
+            />
+            {placeMode === "connect" && (
+              <div style={{ fontSize: 11, color: ACCENT, marginTop: 6 }}>
+                {connectFromId
+                  ? "Drag to another anchor and release to connect."
+                  : "Click and drag from an anchor to another anchor on the canvas."}
+              </div>
+            )}
+          </div>
           <div style={{ display: "flex", gap: 4, marginBottom: 8, alignItems: "center" }}>
             <select value={connFrom} onChange={(e) => setConnFrom(e.target.value)} style={{ ...selectStyle, flex: 1 }}>
               <option value="">from…</option>
@@ -1479,7 +1537,7 @@ export default function GardenPavingDesigner() {
             viewBox={`0 0 ${gardenW} ${gardenH}`}
             width={VB_W}
             height={VB_H}
-            style={{ background: PLANT_BG, borderRadius: 4, boxShadow: "0 1px 3px rgba(0,0,0,0.12)", cursor: placeMode ? "crosshair" : dragId ? "grabbing" : "default" }}
+            style={{ background: PLANT_BG, borderRadius: 4, boxShadow: "0 1px 3px rgba(0,0,0,0.12)", cursor: connectFromId ? "crosshair" : placeMode ? "crosshair" : dragId ? "grabbing" : "default" }}
             onClick={handleCanvasClick}
             onDoubleClick={() => { if (FREEFORM_MODES.includes(placeMode)) finishFreeformDraw(); }}
             onMouseDown={handleCanvasMouseDown}
@@ -1576,8 +1634,24 @@ export default function GardenPavingDesigner() {
               );
             })()}
 
+            {connectFromId && connectPreviewPoint && anchorById[connectFromId] && (
+              <line
+                x1={anchorById[connectFromId].x} y1={anchorById[connectFromId].y}
+                x2={connectPreviewPoint[0]} y2={connectPreviewPoint[1]}
+                stroke={ACCENT} strokeWidth={gardenW * 0.0018} strokeDasharray="14,8" strokeLinecap="round"
+              />
+            )}
+
             {showAnchors && anchors.map((a) => (
-              <g key={a.id} onMouseDown={handleAnchorPointerDown(a.id)} style={{ cursor: "grab" }}>
+              <g
+                key={a.id}
+                onMouseDown={handleAnchorPointerDown(a.id)}
+                onMouseUp={handleAnchorPointerUp(a.id)}
+                style={{ cursor: placeMode === "connect" ? "crosshair" : "grab" }}
+              >
+                {connectFromId === a.id && (
+                  <circle cx={a.x} cy={a.y} r={gardenW * 0.016} fill="none" stroke={ACCENT} strokeWidth={gardenW * 0.0018} strokeDasharray="6,5" />
+                )}
                 {a.type === "door" ? (
                   <rect x={a.x - gardenW * 0.009} y={a.y - gardenW * 0.009} width={gardenW * 0.018} height={gardenW * 0.018}
                     fill={INK} stroke={PAPER} strokeWidth={gardenW * 0.0015} />
