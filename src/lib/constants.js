@@ -16,3 +16,39 @@ export const ACCENT = "#BE6A47";
 // ============================================================
 export const MIN_PEDESTRIAN_WIDTH_MM = 400;
 export const MIN_TILES_ACROSS = 2;
+
+// ============================================================
+// Rendering sizes -- fixed real-world (mm) sizes for on-canvas elements, so line weights
+// and markers stay true to scale and don't change apparent screen size as the user zooms
+// (matching how a real scale drawing behaves). UI-only chrome (selection highlight, vertex
+// drag handles) is deliberately NOT in here -- those size themselves from screen pixels in
+// App.jsx so they stay grabbable/visible at any zoom level instead.
+// ============================================================
+export const HATCH_CELL_MM = 160;
+export const HATCH_LINE_MM = 22;
+export const PLANTING_DOT_R_MM = 12;
+export const TILE_STROKE_MM = 5;
+export const CENTERLINE_STROKE_MM = 12;
+export const MEANDER_STROKE_MM = 8;
+export const EXCLUSION_STROKE_MM = 12;
+export const EXCLUSION_LABEL_FONT_MM = 100;
+export const BOUNDARY_STROKE_MM = 14;
+export const BOUNDARY_DASH_MM = [55, 45];
+export const DRAW_PREVIEW_STROKE_MM = 14;
+export const DRAW_POINT_R_MM = 45;
+export const DRAW_POINT_STROKE_MM = 12;
+export const CONNECT_PREVIEW_STROKE_MM = 16;
+export const ANCHOR_SELECT_RING_R_MM = 150;
+export const ANCHOR_SELECT_RING_STROKE_MM = 16;
+export const ANCHOR_DOOR_HALF_MM = 80;
+export const ANCHOR_STROKE_MM = 14;
+export const ANCHOR_JUNCTION_SIZE_MM = 100;
+export const ANCHOR_PATIO_R_MM = 80;
+export const ANCHOR_LABEL_OFFSET_MM = 150;
+export const ANCHOR_LABEL_FONT_MM = 100;
+
+// ============================================================
+// Viewport (pan/zoom) bounds, mm -- how far the user can zoom in/out.
+// ============================================================
+export const MIN_VIEWPORT_WIDTH_MM = 300; // ~1:1 close-up
+export const MAX_VIEWPORT_WIDTH_MM = 300000; // ~300m wide
