@@ -1,7 +1,10 @@
 // ============================================================
 // Geometry: organic paths (Catmull-Rom + wobble, boundary-aware)
 // ============================================================
-import { polygonBBox, clampPointToBBox, pointInPoly, gaussian, segmentsIntersect, polygonCentroid } from "./geometryUtils";
+import {
+  polygonBBox, clampPointToBBox, pointInPoly, gaussian, segmentsIntersect, polygonCentroid,
+  reflexVertexIndices, signedDistanceToPolygon, polygonSignedArea,
+} from "./geometryUtils";
 
 export function catmullRom(points, samplesPerSeg = 16) {
   const pts = points;
@@ -64,18 +67,24 @@ function maxOffsetBeforeEnteringPolygon(base, dir, poly) {
   }
   return minT;
 }
-function maxOffsetAvoiding(base, dir, boundaryPoly, exclusionPolys) {
-  let avail = maxOffsetInDirectionPoly(base, dir, boundaryPoly);
+function maxOffsetAvoiding(base, dir, boundaryPoly, exclusionPolys, boundaryClearanceMm = 0) {
+  // subtract the required boundary clearance directly from the ray-cast distance (rather
+  // than shrinking/rebuilding the boundary polygon itself) -- exclusion polygons are already
+  // pre-inflated by the caller before reaching here, so they don't need the same treatment.
+  let avail = maxOffsetInDirectionPoly(base, dir, boundaryPoly) - boundaryClearanceMm;
   for (const poly of exclusionPolys) avail = Math.min(avail, maxOffsetBeforeEnteringPolygon(base, dir, poly));
-  return avail;
+  return Math.max(avail, 0);
 }
 
-export function makeOrganicPath(a, b, wobble, rng, boundaryPoly, exclusionPolys = []) {
-  // Control points are kept inside the (possibly irregular) boundary polygon, AND outside
-  // every exclusion zone, via ray-cast clamping in whichever random direction was drawn. The
-  // final sampled curve gets a light bounding-box safety clamp too, in case of minor spline
-  // overshoot between control points near a non-convex notch -- exact, but only approximate
-  // near sharply concave corners (a known limitation, not a silent bug).
+export function makeOrganicPath(a, b, wobble, rng, boundaryPoly, exclusionPolys = [], boundaryClearanceMm = 0) {
+  // Control points are kept inside the (possibly irregular) boundary polygon -- with the
+  // required clearance -- AND outside every exclusion zone, via ray-cast clamping in
+  // whichever random direction was drawn. This keeps the WOBBLE off the boundary/exclusions;
+  // it does NOT by itself guarantee the curve between control points can't cut across a
+  // concave notch of the boundary that lies between two rays -- callers that route through
+  // makeOrganicRoutedPath get a real fix for that (see routeWithinBoundary + the
+  // validate-or-fallback step below); a bare call to makeOrganicPath with a boundary that
+  // has concave notches between `a` and `b` doesn't get that protection.
   const bbox = polygonBBox(boundaryPoly);
   const d = [b[0] - a[0], b[1] - a[1]];
   const len = Math.hypot(d[0], d[1]) + 1e-9;
@@ -87,7 +96,7 @@ export function makeOrganicPath(a, b, wobble, rng, boundaryPoly, exclusionPolys 
     const base = [a[0] + d[0] * t, a[1] + d[1] * t];
     const z = gaussian(rng);
     const dir = z >= 0 ? normal : [-normal[0], -normal[1]];
-    const avail = maxOffsetAvoiding(base, dir, boundaryPoly, exclusionPolys);
+    const avail = maxOffsetAvoiding(base, dir, boundaryPoly, exclusionPolys, boundaryClearanceMm);
     const mag = Math.min(Math.abs(z) * wobble, avail * 0.95);
     ctrls.push([base[0] + dir[0] * mag, base[1] + dir[1] * mag]);
   }
@@ -120,15 +129,88 @@ function segmentCrossesPolygon(p1, p2, poly) {
   const mid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
   return pointInPoly(mid, poly); // catches a diagonal that passes fully through without crossing an edge
 }
-function routeAroundObstacles(start, end, exclusionPolysInflated) {
-  if (exclusionPolysInflated.length === 0) return [start, end];
-  const blocked = exclusionPolysInflated.some((poly) => segmentCrossesPolygon(start, end, poly));
-  if (!blocked) return [start, end]; // direct line is already clear -- don't bother routing
+function segmentStaysInBoundary(a, b, boundaryPoly, clearanceMm, samples = 8) {
+  // sampled, not analytic -- but that's the same trade-off segmentClearsObstacles makes in
+  // meanderTracks.js for the identical reason: an exact "segment vs. concave polygon with
+  // clearance" solve isn't worth the complexity here, and dense enough sampling along paths
+  // this short (a handful of metres) can't miss a boundary crossing that matters visually.
+  for (let s = 0; s <= samples; s++) {
+    const t = s / samples;
+    const p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+    if (signedDistanceToPolygon(p, boundaryPoly) < clearanceMm) return false;
+  }
+  return true;
+}
+function normalize2(v) {
+  const len = Math.hypot(v[0], v[1]) || 1;
+  return [v[0] / len, v[1] / len];
+}
+function insetReflexVertices(boundaryPoly, insetMm) {
+  // the ONLY boundary vertices a route can ever need to bend around -- a straight line
+  // between two points that are each clear of every convex corner is always fine; it's only
+  // a concave (reflex) notch that can let a straight line cut outside the polygon.
+  //
+  // Each reflex vertex is replaced by the mitered inward-offset corner: shift both adjacent
+  // edges inward (along their own inward normal) by insetMm and intersect them. That's the
+  // exact point that keeps insetMm clearance from BOTH adjacent edges -- simply stepping
+  // insetMm toward the centroid (a plain radial nudge) understates the needed distance at
+  // anything sharper than a very obtuse corner, since the centroid direction is rarely the
+  // shared perpendicular of both edges (this is what let routes graze a "cleared" corner in
+  // testing: the naive centroid-nudge point was clearanceMm from the VERTEX but well under
+  // clearanceMm from one of the edges leading into it).
+  if (insetMm <= 0) return [];
+  const idxs = reflexVertexIndices(boundaryPoly);
+  if (idxs.length === 0) return [];
+  const n = boundaryPoly.length;
+  const sign = polygonSignedArea(boundaryPoly) >= 0 ? 1 : -1;
+  const [cx, cy] = polygonCentroid(boundaryPoly);
+  return idxs.map((i) => {
+    const p = boundaryPoly[(i - 1 + n) % n], v = boundaryPoly[i], nx = boundaryPoly[(i + 1) % n];
+    const d1 = normalize2([v[0] - p[0], v[1] - p[1]]);
+    const d2 = normalize2([nx[0] - v[0], nx[1] - v[1]]);
+    const n1 = [sign * -d1[1], sign * d1[0]];
+    const n2 = [sign * -d2[1], sign * d2[0]];
+    const p1 = [v[0] + insetMm * n1[0], v[1] + insetMm * n1[1]];
+    const p2 = [v[0] + insetMm * n2[0], v[1] + insetMm * n2[1]];
+    const denom = d1[0] * d2[1] - d1[1] * d2[0];
+    let out;
+    if (Math.abs(denom) < 1e-9) {
+      out = [v[0] + insetMm * (n1[0] + n2[0]), v[1] + insetMm * (n1[1] + n2[1])];
+    } else {
+      const t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / denom;
+      out = [p1[0] + t * d1[0], p1[1] + t * d1[1]];
+    }
+    // an extremely sharp reflex angle can push the miter point unreasonably far out (even
+    // past the centroid) -- cap the excursion at the distance to the centroid so it always
+    // stays a sane, roughly-central waypoint rather than shooting off across the shape.
+    const centroidDist = Math.hypot(cx - v[0], cy - v[1]) || 1;
+    const outDist = Math.hypot(out[0] - v[0], out[1] - v[1]);
+    if (outDist > centroidDist) {
+      const t = centroidDist / outDist;
+      out = [v[0] + (out[0] - v[0]) * t, v[1] + (out[1] - v[1]) * t];
+    }
+    return out;
+  });
+}
+function edgeIsClear(a, b, boundaryPoly, boundaryClearanceMm, exclusionPolysInflated) {
+  if (!segmentStaysInBoundary(a, b, boundaryPoly, boundaryClearanceMm)) return false;
+  return !exclusionPolysInflated.some((poly) => segmentCrossesPolygon(a, b, poly));
+}
+// Generalizes the old exclusion-only router: the routing domain is now "inside boundaryPoly
+// (with clearance) AND outside every exclusion zone", so the garden boundary itself is a
+// real obstacle to route around, not just a clamp on individual wobble control points. Node
+// set = start/end, every exclusion-zone vertex (pre-inflated outward by the caller), and
+// every reflex boundary vertex (inset inward here) -- exactly the corners a shortest path
+// through this domain could ever need to touch.
+function routeWithinBoundary(start, end, boundaryPoly, exclusionPolysInflated, boundaryClearanceMm) {
+  if (edgeIsClear(start, end, boundaryPoly, boundaryClearanceMm, exclusionPolysInflated)) return [start, end];
+  const reflexPts = insetReflexVertices(boundaryPoly, boundaryClearanceMm);
+  if (reflexPts.length === 0 && exclusionPolysInflated.length === 0) return [start, end]; // nothing to route around
 
-  const nodes = [start, end];
+  const nodes = [start, end, ...reflexPts];
   exclusionPolysInflated.forEach((poly) => poly.forEach((v) => nodes.push(v)));
   const n = nodes.length;
-  const clear = (i, j) => !exclusionPolysInflated.some((poly) => segmentCrossesPolygon(nodes[i], nodes[j], poly));
+  const clear = (i, j) => edgeIsClear(nodes[i], nodes[j], boundaryPoly, boundaryClearanceMm, exclusionPolysInflated);
 
   const adj = Array.from({ length: n }, () => []);
   for (let i = 0; i < n; i++) {
@@ -157,38 +239,79 @@ function routeAroundObstacles(start, end, exclusionPolysInflated) {
   path.reverse();
   return path;
 }
+function polylineStaysValid(poly, boundaryPoly, clearanceMm, exclusionPolysInflated) {
+  for (let i = 0; i < poly.length - 1; i++) {
+    if (!segmentStaysInBoundary(poly[i], poly[i + 1], boundaryPoly, clearanceMm)) return false;
+    if (exclusionPolysInflated.some((ex) => segmentCrossesPolygon(poly[i], poly[i + 1], ex))) return false;
+  }
+  return true;
+}
+function validateRoutedCurve(smoothed, waypoints, boundaryPoly, clearanceMm, exclusionPolysInflated) {
+  // three-tier fallback, mirroring meanderTracks.js's smoothAndValidate: prefer the smoothed
+  // organic curve, but only if it's actually re-checked as safe (decimation/wobble can
+  // reintroduce a violation the routing step avoided); degrade to the straight routed
+  // waypoints otherwise, since every consecutive pair of those was certified clear above.
+  if (polylineStaysValid(smoothed, boundaryPoly, clearanceMm, exclusionPolysInflated)) return smoothed;
+  return waypoints;
+}
 export function makeOrganicRoutedPath(a, b, wobble, rng, boundaryPoly, exclusionZones, clearanceMm = 300) {
-  if (!exclusionZones || exclusionZones.length === 0) return makeOrganicPath(a, b, wobble, rng, boundaryPoly, []);
-  const inflated = exclusionZones.map((z) => inflatePolygonFromCentroid(z.poly, clearanceMm));
-  const waypoints = routeAroundObstacles(a, b, inflated);
-  if (waypoints.length <= 2) return makeOrganicPath(a, b, wobble, rng, boundaryPoly, inflated);
+  const inflated = (exclusionZones || []).map((z) => inflatePolygonFromCentroid(z.poly, clearanceMm));
+  const waypoints = routeWithinBoundary(a, b, boundaryPoly, inflated, clearanceMm);
+  if (waypoints.length <= 2) {
+    const smoothed = makeOrganicPath(a, b, wobble, rng, boundaryPoly, inflated, clearanceMm);
+    return validateRoutedCurve(smoothed, waypoints, boundaryPoly, clearanceMm, inflated);
+  }
   // multiple straight legs around one or more corners -- wobble each leg independently
   // (smaller budget than a single unobstructed span would get) so smoothing stays local and
-  // can't wander back into the obstacle it just went around
+  // can't wander back into the obstacle (or boundary notch) it just went around
   let full = [waypoints[0]];
   for (let i = 0; i < waypoints.length - 1; i++) {
-    const legPoly = makeOrganicPath(waypoints[i], waypoints[i + 1], wobble * 0.4, rng, boundaryPoly, inflated);
+    const legPoly = makeOrganicPath(waypoints[i], waypoints[i + 1], wobble * 0.4, rng, boundaryPoly, inflated, clearanceMm);
     full = full.concat(legPoly.slice(1));
   }
-  return full;
+  return validateRoutedCurve(full, waypoints, boundaryPoly, clearanceMm, inflated);
 }
 
-export function makePatioBlob(center, baseRadius, rng, jitter = 0.24, nPts = 16, boundaryPoly = null) {
+export function makePatioBlob(center, baseRadius, rng, jitter = 0.24, nPts = 16, boundaryPoly = null, boundaryClearanceMm = 0) {
   // same boundary-aware capping as makeOrganicPath's control points -- without this, a
   // patio anchor placed near an edge can have its jittered outline poke straight through
   // the boundary (paved tiles stay correctly excluded either way since tile generation is
   // filtered independently, but the outline itself would be visually wrong).
-  const pts = [];
+  const angles = [], radii = [];
   for (let i = 0; i < nPts; i++) {
-    const angle = (2 * Math.PI * i) / nPts;
-    const r = baseRadius * (1 + (rng() * 2 - 1) * jitter);
+    angles.push((2 * Math.PI * i) / nPts);
+    radii.push(baseRadius * (1 + (rng() * 2 - 1) * jitter));
+  }
+  const computePoint = (i, r) => {
+    const angle = angles[i];
     const dir = [Math.cos(angle), Math.sin(angle)];
     let finalR = r;
     if (boundaryPoly) {
-      const avail = maxOffsetInDirectionPoly(center, dir, boundaryPoly);
-      finalR = Math.min(r, avail * 0.95);
+      const avail = maxOffsetInDirectionPoly(center, dir, boundaryPoly) - boundaryClearanceMm;
+      finalR = Math.min(r, Math.max(avail, 0) * 0.95);
     }
-    pts.push([center[0] + finalR * Math.cos(angle), center[1] + finalR * Math.sin(angle)]);
+    return [center[0] + finalR * Math.cos(angle), center[1] + finalR * Math.sin(angle)];
+  };
+  let pts = radii.map((r, i) => computePoint(i, r));
+  if (!boundaryPoly) return pts;
+  // each vertex individually clears the boundary by construction above (its own ray-cast is
+  // exact for a simple polygon), but the EDGE between two adjacent vertices can still cut
+  // across a concave notch that lies between their two ray directions -- shrink any
+  // offending pair toward the center and retry. Bounded, not exact: this is a jittered
+  // decorative outline, not a load-bearing path, so "eventually stops violating" is an
+  // acceptable stopping condition, same spirit as the routed-path validate-or-fallback above.
+  for (let pass = 0; pass < 6; pass++) {
+    let violated = false;
+    for (let i = 0; i < nPts; i++) {
+      const j = (i + 1) % nPts;
+      if (!segmentStaysInBoundary(pts[i], pts[j], boundaryPoly, boundaryClearanceMm)) {
+        violated = true;
+        radii[i] *= 0.8; radii[j] *= 0.8;
+        pts[i] = computePoint(i, radii[i]);
+        pts[j] = computePoint(j, radii[j]);
+      }
+    }
+    if (!violated) break;
   }
   return pts;
 }

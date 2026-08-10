@@ -18,6 +18,13 @@ export const MIN_PEDESTRIAN_WIDTH_MM = 400;
 export const MIN_TILES_ACROSS = 2;
 
 // ============================================================
+// Boundary repulsion -- default minimum distance any path/patio outline must keep from the
+// garden boundary edge (also used as the fallback when routing around a concave boundary
+// notch). User-adjustable via the "Boundary clearance" slider; this is just the initial value.
+// ============================================================
+export const DEFAULT_BOUNDARY_CLEARANCE_MM = 300;
+
+// ============================================================
 // Rendering sizes -- fixed real-world (mm) sizes for on-canvas elements, so line weights
 // and markers stay true to scale and don't change apparent screen size as the user zooms
 // (matching how a real scale drawing behaves). UI-only chrome (selection highlight, vertex

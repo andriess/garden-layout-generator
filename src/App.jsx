@@ -11,6 +11,7 @@ import {
   ANCHOR_DOOR_HALF_MM, ANCHOR_STROKE_MM, ANCHOR_JUNCTION_SIZE_MM, ANCHOR_PATIO_R_MM,
   ANCHOR_LABEL_OFFSET_MM, ANCHOR_LABEL_FONT_MM, MIN_VIEWPORT_WIDTH_MM, MAX_VIEWPORT_WIDTH_MM,
   LENGTH_LABEL_FONT_PX, LENGTH_INPUT_WIDTH_PX, LENGTH_INPUT_HEIGHT_PX,
+  DEFAULT_BOUNDARY_CLEARANCE_MM,
 } from "./lib/constants";
 import {
   mulberry32, polygonBBox, pointInPoly, pointSegDist, signedDistanceToPolygon, polygonCentroid,
@@ -60,6 +61,9 @@ export default function GardenPavingDesigner() {
   const [gardenBoundary, setGardenBoundary] = useState([]);
   const [boundaryShapeKind, setBoundaryShapeKind] = useState("rect"); // "rect" | "freeform" -- drives edge-length editing
   const [exclusionZones, setExclusionZones] = useState([]); // [{id, label, poly, shapeKind}] -- house footprint etc.
+  // minimum distance any path/patio outline (and meander track) must keep from the boundary
+  // edge -- also doubles as the routing corridor's boundary clearance for concave notches.
+  const [boundaryClearanceMm, setBoundaryClearanceMm] = useState(DEFAULT_BOUNDARY_CLEARANCE_MM);
 
   // --- anchors & connections (also empty by default) ---
   const [anchors, setAnchors] = useState([]);
@@ -278,7 +282,7 @@ export default function GardenPavingDesigner() {
       const a = anchorById[c.a], b = anchorById[c.b];
       if (!a || !b) continue;
       const { clamped, wasClamped, required } = validatePathWidth(c.widthMm, geom.acrossMm);
-      const poly = makeOrganicRoutedPath([a.x, a.y], [b.x, b.y], wobbleMm, localRng, gardenBoundary, exclusionZones);
+      const poly = makeOrganicRoutedPath([a.x, a.y], [b.x, b.y], wobbleMm, localRng, gardenBoundary, exclusionZones, boundaryClearanceMm);
       polys.push({ poly, widthMm: clamped, from: a.label, to: b.label });
       report.push({ from: a.label, to: b.label, requestedMm: c.widthMm, usedMm: clamped, requiredMm: required, clamped: wasClamped });
       // flag (not fix) any path whose centerline dips into a marked house/exclusion zone --
@@ -292,11 +296,11 @@ export default function GardenPavingDesigner() {
       }
     }
     const blobs = anchors.filter((a) => a.type === "patio").map((a) => ({
-      poly: a.customPolygon && a.customPolygon.length >= 3 ? a.customPolygon : makePatioBlob([a.x, a.y], a.radius || 1000, localRng, 0.24, 16, gardenBoundary),
+      poly: a.customPolygon && a.customPolygon.length >= 3 ? a.customPolygon : makePatioBlob([a.x, a.y], a.radius || 1000, localRng, 0.24, 16, gardenBoundary, boundaryClearanceMm),
       label: a.label,
     }));
     return { pathPolys: polys, clampReport: report, patioBlobs: blobs, exclusionWarnings: warnings };
-  }, [connections, anchorById, wobbleMm, seed, gardenBoundary, geom.acrossMm, anchors, exclusionZones, hasBoundary]);
+  }, [connections, anchorById, wobbleMm, seed, gardenBoundary, geom.acrossMm, anchors, exclusionZones, hasBoundary, boundaryClearanceMm]);
 
   // ---- zones ----
   const zoneSeeds = useMemo(() => {
@@ -328,13 +332,13 @@ export default function GardenPavingDesigner() {
       patioPolys: patioBlobs.map((b) => b.poly),
       count: meanderCount,
       minPathClearanceMm: meanderClearanceMm,
-      minBoundaryClearanceMm: 300,
+      minBoundaryClearanceMm: boundaryClearanceMm,
       boundaryPoly: gardenBoundary,
       exclusionPolys: exclusionZones.map((z) => z.poly),
       minTrackSepMm: 500,
       seed: meanderSeed * 7159 + 11,
     });
-  }, [hasBoundary, showMeander, meanderCount, meanderClearanceMm, anchors, connections, pathPolys, patioBlobs, gardenBoundary, exclusionZones, meanderSeed]);
+  }, [hasBoundary, showMeander, meanderCount, meanderClearanceMm, anchors, connections, pathPolys, patioBlobs, gardenBoundary, exclusionZones, meanderSeed, boundaryClearanceMm]);
 
   const paved = useMemo(() => {
     const scatterRng = mulberry32(seed * 7919 + 3);
@@ -881,6 +885,13 @@ export default function GardenPavingDesigner() {
               </div>
             </div>
           )}
+          <Row label={`Boundary clearance (${boundaryClearanceMm}mm)`}>
+            <input type="range" min={0} max={1500} step={50} value={boundaryClearanceMm}
+              onChange={(e) => setBoundaryClearanceMm(+e.target.value)} style={{ width: "100%" }} />
+          </Row>
+          <div style={{ fontSize: 10, color: INK_SOFT }}>
+            Minimum distance paths, patios, and meander tracks must keep from the boundary edge -- they always route around it, never through it.
+          </div>
         </Section>
 
         <Section title="House / exclusions">
