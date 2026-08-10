@@ -52,3 +52,12 @@ export const ANCHOR_LABEL_FONT_MM = 100;
 // ============================================================
 export const MIN_VIEWPORT_WIDTH_MM = 300; // ~1:1 close-up
 export const MAX_VIEWPORT_WIDTH_MM = 300000; // ~300m wide
+
+// ============================================================
+// Edge/diameter length labels & inputs (drawn-shape length editing) -- screen-px constants
+// like the vertex-handle sizing above, so the label/input stays a fixed on-screen size
+// (readable, clickable) at any zoom level rather than scaling with the mm geometry.
+// ============================================================
+export const LENGTH_LABEL_FONT_PX = 11;
+export const LENGTH_INPUT_WIDTH_PX = 64;
+export const LENGTH_INPUT_HEIGHT_PX = 20;

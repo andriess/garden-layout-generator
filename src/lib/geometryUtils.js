@@ -81,3 +81,37 @@ export function segmentsIntersect(p1, p2, p3, p4) {
   const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
+
+// ---- edge/segment length helpers, shared by the drawn-shape length labels (live preview
+// while drawing, and the editable per-edge inputs once a shape is selected) ----
+
+// closed-polygon edge lengths -- edge i runs poly[i] -> poly[(i+1) % n], so the last entry
+// is the closing edge back to the first point (every finished drawn shape renders as a
+// closed <polygon>, so that closing edge is a real, visible, editable line too).
+export function polygonEdgeLengths(poly) {
+  const n = poly.length;
+  const lens = [];
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    lens.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+  }
+  return lens;
+}
+
+// open-chain segment lengths -- used for the freeform draw-in-progress preview, before the
+// shape is closed into a polygon.
+export function polylineSegmentLengths(points) {
+  const lens = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    lens.push(Math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1]));
+  }
+  return lens;
+}
+
+// moves `to` along the from->to direction so the segment becomes exactly `newLen` long,
+// keeping `from` and the direction fixed -- the basis of freeform per-edge length editing.
+export function pointAtDistance(from, to, newLen) {
+  const dx = to[0] - from[0], dy = to[1] - from[1];
+  const len = Math.hypot(dx, dy) || 1e-9;
+  return [from[0] + (dx / len) * newLen, from[1] + (dy / len) * newLen];
+}
