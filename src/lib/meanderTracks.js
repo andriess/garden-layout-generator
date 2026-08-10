@@ -83,7 +83,43 @@ function buildClearanceGrid({ boundaryPoly, mainPathPolys, exclusionPolys, avoid
       safe[idx(c, r)] = ok ? 1 : 0;
     }
   }
-  return { bbox, cols, rows, cellMm, safe, idx, cellCenter };
+  const openness = buildOpennessField(cols, rows, safe, idx, cellMm);
+  return { bbox, cols, rows, cellMm, safe, idx, cellCenter, openness };
+}
+
+function buildOpennessField(cols, rows, safe, idx, cellMm) {
+  // Multi-source Dijkstra distance transform: for every safe cell, the true (not just
+  // axis-aligned) distance in mm to the nearest obstacle/unsafe cell -- boundary, path,
+  // patio, exclusion zone, or already-placed track, since all of those are baked into
+  // `safe` already. This is what lets aStarSearch tell a route hugging the edge of the
+  // safe region apart from one cutting through the open middle of a pocket, which a plain
+  // safe/unsafe grid genuinely cannot: both count as equally 'safe' to it otherwise.
+  const n = cols * rows;
+  const dist = new Float64Array(n).fill(Infinity);
+  const visited = new Uint8Array(n);
+  const open = new MinHeap();
+  for (let i = 0; i < n; i++) {
+    if (!safe[i]) { dist[i] = 0; open.push(i, 0); }
+  }
+  while (open.size > 0) {
+    const cur = open.pop();
+    if (visited[cur]) continue;
+    visited[cur] = 1;
+    const cr = Math.floor(cur / cols), cc = cur % cols;
+    for (let dc = -1; dc <= 1; dc++) {
+      for (let dr = -1; dr <= 1; dr++) {
+        if (dc === 0 && dr === 0) continue;
+        const nc = cc + dc, nr = cr + dr;
+        if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
+        const nIdx = idx(nc, nr);
+        if (visited[nIdx]) continue;
+        const step = Math.hypot(dc, dr) * cellMm;
+        const cand = dist[cur] + step;
+        if (cand < dist[nIdx]) { dist[nIdx] = cand; open.push(nIdx, cand); }
+      }
+    }
+  }
+  return dist;
 }
 
 function computeGridPockets(grid) {
@@ -122,6 +158,35 @@ function pocketOf(grid, pocketLabels, point) {
   if (!cell) return -1;
   return pocketLabels[grid.idx(cell[0], cell[1])];
 }
+function pocketCellIndices(pocketLabels, pocketId) {
+  const out = [];
+  for (let i = 0; i < pocketLabels.length; i++) if (pocketLabels[i] === pocketId) out.push(i);
+  return out;
+}
+function pickWanderWaypoint(grid, pocketCells, aPos, bPos, rng, excludeMm = 700) {
+  // Deliberately routes THROUGH one of the most open cells in the shared pocket, rather than
+  // merely discounting the cost of cells near it -- a soft cost nudge still lets total path
+  // length dominate the decision (that's exactly what produced the disappointing ~15% detours
+  // before). Picking an explicit waypoint and then pathfinding TO it removes length from the
+  // decision of *whether* to detour entirely; length only still matters for how each leg gets
+  // there, which is fine -- it should still be a walkable route, not a random line.
+  const { cellCenter, cols, openness } = grid;
+  const ranked = [];
+  for (const i of pocketCells) {
+    const r = Math.floor(i / cols), c = i % cols;
+    const p = cellCenter(c, r);
+    if (Math.hypot(p[0] - aPos[0], p[1] - aPos[1]) < excludeMm) continue;
+    if (Math.hypot(p[0] - bPos[0], p[1] - bPos[1]) < excludeMm) continue;
+    ranked.push([p, openness[i]]);
+  }
+  if (ranked.length === 0) return null;
+  ranked.sort((x, y) => y[1] - x[1]);
+  // top-N by openness, not just the single global peak -- keeps repeated tracks through the
+  // same pocket from all converging on the exact same point, and the peak itself might be a
+  // single-cell fluke; any of these is genuinely "the open part of the pocket".
+  const top = ranked.slice(0, Math.min(8, ranked.length));
+  return top[Math.floor(rng() * top.length)][0];
+}
 function nearestSafeCell(grid, p) {
   const { cols, rows, cellMm, bbox, safe, idx } = grid;
   const c0 = Math.min(Math.max(Math.floor((p[0] - bbox.xMin) / cellMm), 0), cols - 1);
@@ -140,8 +205,20 @@ function nearestSafeCell(grid, p) {
   return null;
 }
 
-function aStarSearch(grid, startPt, goalPt) {
-  const { cols, rows, cellMm, safe, idx, cellCenter } = grid;
+function opennessCostFactor(clearanceMm, biasTargetMm, biasStrength) {
+  // 1x cost once a cell is `biasTargetMm` or more from the nearest obstacle (deep in an open
+  // pocket); rising smoothly to (1 + biasStrength)x right at the minimum-clearance edge of the
+  // safe region. Steepest right where minimum-clearance corridors along paths/patios/boundary
+  // sit, which is exactly what makes A* prefer bulging into open space over hugging them --
+  // straight-line-shortest is no longer automatically cheapest.
+  if (biasStrength <= 0 || biasTargetMm <= 0) return 1;
+  const t = Math.min(1, Math.max(0, clearanceMm / biasTargetMm));
+  const eased = t * t; // ease-in: bias falls off fast once there's *some* breathing room
+  return 1 + biasStrength * (1 - eased);
+}
+
+function aStarSearch(grid, startPt, goalPt, biasTargetMm = 0, biasStrength = 0) {
+  const { cols, rows, cellMm, safe, idx, cellCenter, openness } = grid;
   const start = nearestSafeCell(grid, startPt);
   const goal = nearestSafeCell(grid, goalPt);
   if (!start || !goal) return null;
@@ -173,7 +250,11 @@ function aStarSearch(grid, startPt, goalPt) {
         if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
         const nIdx = idx(nc, nr);
         if (!safe[nIdx] || closed[nIdx]) continue;
-        const stepCost = Math.hypot(dc, dr) * cellMm;
+        // factor keyed off the *destination* cell's openness -- a step landing deeper in a
+        // pocket is cheap, a step landing right back against an obstacle edge is expensive.
+        // Since the factor is always >= 1, the plain-Euclidean heuristic stays admissible.
+        const factor = opennessCostFactor(openness[nIdx], biasTargetMm, biasStrength);
+        const stepCost = Math.hypot(dc, dr) * cellMm * factor;
         const tentative = gScore[curIdx] + stepCost;
         if (tentative < gScore[nIdx]) {
           gScore[nIdx] = tentative;
@@ -316,7 +397,7 @@ function endpointsTooSimilar(a, b, usedPairs, minSepMm) {
   return false;
 }
 
-export function generateMeanderTracks({ anchors, connections, mainPathPolys, patioPolys = [], count, boundaryPoly, exclusionPolys, minPathClearanceMm, minBoundaryClearanceMm = 300, minTrackSepMm, minEndpointReuseSepMm = 1200, preferAnchorProb = 0.8, seed, cellMm = 150 }) {
+export function generateMeanderTracks({ anchors, connections, mainPathPolys, patioPolys = [], count, boundaryPoly, exclusionPolys, minPathClearanceMm, minBoundaryClearanceMm = 300, minTrackSepMm, minEndpointReuseSepMm = 1200, preferAnchorProb = 0.8, seed, cellMm = 150, openSpaceBiasStrength = 1.5, wanderProb = 0.85 }) {
   const rng = mulberry32(seed);
   const accepted = [];
   const usedPairs = [];
@@ -327,6 +408,11 @@ export function generateMeanderTracks({ anchors, connections, mainPathPolys, pat
   const candidates = buildMeanderCandidates(anchors, connections, mainPathPolys);
   const anchorCandidates = candidates.filter((c) => c.isAnchor);
   if (candidates.length < 2 || mainPathPolys.length === 0) return [];
+  // Mild per-leg openness bias (see opennessCostFactor) -- just enough to stop each leg from
+  // tracing the minimum-clearance edge on its way to/from the wander waypoint below, which
+  // is what actually does the work of getting a track deep into a pocket. Not a length
+  // trade-off knob: the waypoint choice deliberately ignores length entirely.
+  const openSpaceBiasTargetMm = Math.max(minPathClearanceMm, minBoundaryClearanceMm, minTrackSepMm || 0) * 3;
 
   for (let t = 0; t < count; t++) {
     // grid rebuilt fresh for every track, folding in everything accepted so far -- this is
@@ -360,7 +446,21 @@ export function generateMeanderTracks({ anchors, connections, mainPathPolys, pat
       const d = Math.hypot(c1.pos[0] - c2.pos[0], c1.pos[1] - c2.pos[1]);
       if (d < 800 || d > 7000) continue;
       if (endpointsTooSimilar(c1.pos, c2.pos, usedPairs, minEndpointReuseSepMm)) continue;
-      const raw = aStarSearch(grid, c1.pos, c2.pos);
+      // Route THROUGH the pocket's open middle whenever one is worth visiting -- this is the
+      // actual "wandering" mechanic (see pickWanderWaypoint), not a length trade-off. Only
+      // falls back to a direct route if no qualifying waypoint exists (tiny/uniform pocket)
+      // or a leg genuinely can't be found.
+      let raw = null;
+      if (rng() < wanderProb) {
+        const pocketCells = pocketCellIndices(pocketLabels, Number(pocketId));
+        const waypoint = pickWanderWaypoint(grid, pocketCells, c1.pos, c2.pos, rng);
+        if (waypoint) {
+          const leg1 = aStarSearch(grid, c1.pos, waypoint, openSpaceBiasTargetMm, openSpaceBiasStrength);
+          const leg2 = aStarSearch(grid, waypoint, c2.pos, openSpaceBiasTargetMm, openSpaceBiasStrength);
+          if (leg1 && leg2) raw = leg1.concat(leg2.slice(1));
+        }
+      }
+      if (!raw) raw = aStarSearch(grid, c1.pos, c2.pos, openSpaceBiasTargetMm, openSpaceBiasStrength);
       if (!raw) continue; // shouldn't normally happen (same pocket) -- fall through and retry regardless
       const waypoints = decimateGridPath(raw);
       const poly = smoothAndValidate(waypoints, raw, mainPathPolys, allExclusionPolys, minPathClearanceMm);
