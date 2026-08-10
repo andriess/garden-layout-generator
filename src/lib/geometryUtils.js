@@ -61,6 +61,34 @@ export function signedDistanceToPolygon(p, poly) {
   return inside ? minDist : -minDist;
 }
 
+export function polygonSignedArea(poly) {
+  let area = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i], [x1, y1] = poly[(i + 1) % poly.length];
+    area += x0 * y1 - x1 * y0;
+  }
+  return area / 2;
+}
+
+// Reflex (concave) vertex indices of a simple polygon, independent of winding order -- the
+// sign of the turn at each vertex is compared against the polygon's overall signed area, so
+// this works whether the polygon happens to be stored clockwise or counter-clockwise
+// (freeform user-drawn boundaries/exclusion zones aren't guaranteed either way). These are
+// exactly the vertices a route ever needs to bend around: a straight line between two points
+// that are each on the "outside" of a reflex corner is the only way a path can cut across a
+// notch instead of going around it.
+export function reflexVertexIndices(poly) {
+  const n = poly.length;
+  const sign = polygonSignedArea(poly) >= 0 ? 1 : -1;
+  const idxs = [];
+  for (let i = 0; i < n; i++) {
+    const a = poly[(i - 1 + n) % n], b = poly[i], c = poly[(i + 1) % n];
+    const cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if (cross * sign < 0) idxs.push(i);
+  }
+  return idxs;
+}
+
 export function polygonCentroid(pts) {
   let x = 0, y = 0, area = 0;
   for (let i = 0; i < pts.length; i++) {
