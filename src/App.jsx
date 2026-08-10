@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { Delaunay } from "d3-delaunay";
-import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square, Link2, Maximize2 } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square, Link2, Maximize2, Download, Upload } from "lucide-react";
 
 import {
   PALETTE, INK, INK_SOFT, PAPER, PANEL_BORDER, APP_BG, PLANT_BG, ACCENT,
@@ -22,6 +22,7 @@ import { resizeSquareToSide, resizeRectToDims, resizeCircleToDiameter } from "./
 import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
 import { generateMeanderTracks, validatePathWidth } from "./lib/meanderTracks";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
+import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, validateImportPayload, maxIdSuffix } from "./lib/persistence";
 import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
 
 // ============================================================
@@ -125,6 +126,7 @@ export default function GardenPavingDesigner() {
 
   const svgRef = useRef(null);
   const canvasWrapRef = useRef(null);
+  const importInputRef = useRef(null);
 
   const hasBoundary = gardenBoundary.length >= 3;
   const mmPerPx = canvasSize.w > 0 ? viewport.w / canvasSize.w : 1;
@@ -705,6 +707,113 @@ export default function GardenPavingDesigner() {
     setForkTo("");
   };
 
+  // ---- save / load: export the design (or just the boundary + house/exclusion zones) to
+  // a downloadable JSON file, and import one back in to keep editing ----
+  const exportDesign = () => {
+    downloadJSON(serializeDesign({
+      gardenW, gardenH, gardenBoundary, boundaryShapeKind, exclusionZones,
+      tileShape, paverAcrossFlats, paverSize, paverWidth, paverHeight, rectBond, rotationDeg,
+      anchors, connections,
+      meanderCount, meanderDensity, meanderClearanceMm, showMeander, meanderSeed,
+      zoneCount, relaxIters, wobbleMm, seed,
+      scatterDensity, scatterMaxMm,
+      showZones, showTiles, showBoundary, showAnchors, showCenterlines, showPlanting,
+    }), `garden-design-${Date.now()}.json`);
+  };
+  const exportBoundary = () => {
+    downloadJSON(serializeBoundary({ gardenW, gardenH, gardenBoundary, boundaryShapeKind, exclusionZones }),
+      `garden-boundary-${Date.now()}.json`);
+  };
+
+  // importing (either kind of file) abandons any in-progress tool/selection state, since
+  // none of it is meaningful against a freshly-swapped-in boundary/design
+  const resetTransientToolState = () => {
+    setPlaceMode(null);
+    setDrawPoints([]);
+    setShapeDragStart(null);
+    setShapeDragCurrent(null);
+    setDragId(null);
+    setConnFrom("");
+    setConnTo("");
+    setConnectFromId(null);
+    setConnectPreviewPoint(null);
+    setSelectedShape(null);
+    setDraggedVertex(null);
+    setForkTo("");
+  };
+  // `uidCounter` is a plain module-level variable (not React state, see top of file) --
+  // bumping it here just mutates it directly so ids handed out after an import never
+  // collide with ids that came from the imported file.
+  const bumpUidCounterPast = (ids) => {
+    const next = maxIdSuffix(ids) + 1;
+    if (next > uidCounter) uidCounter = next;
+  };
+
+  const handleImportFile = async (file) => {
+    let payload;
+    try {
+      payload = await readImportFile(file);
+    } catch (err) {
+      window.alert(err.message);
+      return;
+    }
+    const { kind, errors } = validateImportPayload(payload);
+    if (!kind || errors.length > 0) {
+      window.alert(`Could not import "${file.name}":\n${errors.join("\n")}`);
+      return;
+    }
+    if (kind === "boundary") {
+      if (!window.confirm("Import boundary & house/exclusion zones? This replaces the current ones -- the rest of the design (tiles, paths, zones, scatter) is left as-is.")) return;
+      setGardenW(payload.gardenW);
+      setGardenH(payload.gardenH);
+      setGardenBoundary(payload.gardenBoundary);
+      setBoundaryShapeKind(payload.boundaryShapeKind);
+      setExclusionZones(payload.exclusionZones);
+      bumpUidCounterPast(payload.exclusionZones.map((z) => z.id));
+    } else {
+      if (!window.confirm("Import full design? This replaces everything currently on screen.")) return;
+      setGardenW(payload.gardenW);
+      setGardenH(payload.gardenH);
+      setGardenBoundary(payload.gardenBoundary);
+      setBoundaryShapeKind(payload.boundaryShapeKind);
+      setExclusionZones(payload.exclusionZones);
+      setTileShape(payload.tileShape);
+      setPaverAcrossFlats(payload.paverAcrossFlats);
+      setPaverSize(payload.paverSize);
+      setPaverWidth(payload.paverWidth);
+      setPaverHeight(payload.paverHeight);
+      setRectBond(payload.rectBond);
+      setRotationDeg(payload.rotationDeg);
+      setAnchors(payload.anchors);
+      setConnections(payload.connections);
+      setMeanderCount(payload.meanderCount);
+      setMeanderDensity(payload.meanderDensity);
+      setMeanderClearanceMm(payload.meanderClearanceMm);
+      setShowMeander(payload.showMeander);
+      setMeanderSeed(payload.meanderSeed);
+      setZoneCount(payload.zoneCount);
+      setRelaxIters(payload.relaxIters);
+      setWobbleMm(payload.wobbleMm);
+      setSeed(payload.seed);
+      setScatterDensity(payload.scatterDensity);
+      setScatterMaxMm(payload.scatterMaxMm);
+      setShowZones(payload.showZones);
+      setShowTiles(payload.showTiles);
+      setShowBoundary(payload.showBoundary);
+      setShowAnchors(payload.showAnchors);
+      setShowCenterlines(payload.showCenterlines);
+      setShowPlanting(payload.showPlanting);
+      bumpUidCounterPast([...payload.exclusionZones.map((z) => z.id), ...payload.anchors.map((a) => a.id)]);
+    }
+    resetTransientToolState();
+    if (payload.gardenBoundary.length >= 3) fitViewToPoints(payload.gardenBoundary);
+  };
+  const onImportInputChange = (evt) => {
+    const file = evt.target.files && evt.target.files[0];
+    evt.target.value = ""; // so re-selecting the same filename later still fires onChange
+    if (file) handleImportFile(file);
+  };
+
   const totalGardenTiles = tileCenters.length;
   const coreCount = paved.filter((t) => t.reason === "core").length;
   const scatterCount = paved.filter((t) => t.reason === "scatter").length;
@@ -724,6 +833,24 @@ export default function GardenPavingDesigner() {
         <div style={{ fontSize: 11.5, color: INK_SOFT, marginBottom: 18 }}>
           Voronoi zones · organic paths · live tile layout
         </div>
+
+        <Section title="Save / load">
+          <div style={{ fontSize: 10, color: INK_SOFT, marginBottom: 8 }}>
+            Export to a JSON file to save your work or share it; import a file later to keep editing.
+          </div>
+          <button onClick={exportDesign} style={{ ...primaryBtnStyle, width: "100%", marginBottom: 6, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <Download size={13} /> Export design
+          </button>
+          <button onClick={exportBoundary} disabled={!hasBoundary}
+            style={{ ...primaryBtnStyle, background: PANEL_BORDER, color: INK, width: "100%", marginBottom: 6, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, opacity: hasBoundary ? 1 : 0.4, cursor: hasBoundary ? "pointer" : "not-allowed" }}>
+            <Download size={13} /> Export boundary only
+          </button>
+          <button onClick={() => importInputRef.current && importInputRef.current.click()}
+            style={{ ...primaryBtnStyle, background: PANEL_BORDER, color: INK, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <Upload size={13} /> Import JSON…
+          </button>
+          <input ref={importInputRef} type="file" accept="application/json" onChange={onImportInputChange} style={{ display: "none" }} />
+        </Section>
 
         <Section title="Garden">
           <Row label="Width (mm)"><NumInput value={gardenW} onChange={setGardenW} step={100} /></Row>
