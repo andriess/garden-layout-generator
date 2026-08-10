@@ -1,6 +1,7 @@
 // ============================================================
 // small presentational helpers used throughout the control rail
 // ============================================================
+import { useState, useEffect, useRef } from "react";
 import { Link2, Trash2 } from "lucide-react";
 import {
   INK, INK_SOFT, PAPER, PANEL_BORDER, ACCENT,
@@ -58,9 +59,26 @@ export function PlaceButton({ active, onClick, icon, label, fullWidth }) {
     }}>{icon}{label}</button>
   );
 }
-export function NumInput({ value, onChange, step = 1 }) {
+export function NumInput({ value, onChange, step = 1, debounceMs = 400 }) {
+  const [local, setLocal] = useState(value);
+  const timerRef = useRef(null);
+
+  // stay in sync if the parent value changes from outside this input (e.g. reset/import)
+  useEffect(() => {
+    setLocal(value);
+  }, [value]);
+
+  useEffect(() => () => clearTimeout(timerRef.current), []);
+
+  const handleChange = (e) => {
+    const next = +e.target.value;
+    setLocal(next);
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => onChange(next), debounceMs);
+  };
+
   return (
-    <input type="number" value={value} step={step} onChange={(e) => onChange(+e.target.value)}
+    <input type="number" value={local} step={step} onChange={handleChange}
       style={{ width: "100%", padding: "5px 8px", fontSize: 12, border: `1px solid ${PANEL_BORDER}`, borderRadius: 4, background: PAPER, color: INK }} />
   );
 }
