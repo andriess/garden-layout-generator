@@ -564,7 +564,15 @@ export default function GardenPavingDesigner() {
     }
     if (dragId) {
       const [x, y] = svgPointFromEvent(evt);
-      setAnchors((prev) => prev.map((a) => (a.id === dragId ? { ...a, x: Math.round(x), y: Math.round(y) } : a)));
+      const nx = Math.round(x), ny = Math.round(y);
+      setAnchors((prev) => prev.map((a) => {
+        if (a.id !== dragId) return a;
+        if (a.customPolygon) {
+          const dx = nx - a.x, dy = ny - a.y;
+          return { ...a, x: nx, y: ny, customPolygon: a.customPolygon.map(([px, py]) => [px + dx, py + dy]) };
+        }
+        return { ...a, x: nx, y: ny };
+      }));
       return;
     }
     if (connectFromId) {
