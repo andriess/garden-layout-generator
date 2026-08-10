@@ -1146,9 +1146,10 @@ export default function GardenPavingDesigner() {
         </Section>
 
         <div style={{ marginTop: 18, padding: "10px 12px", background: "#F1ECE0", borderRadius: 6, fontSize: 10.5, color: INK_SOFT, lineHeight: 1.5 }}>
-          Known gap vs. the original prototype: no disconnected-void-'pocket' detection, so a
-          meander track occasionally fails to route even when a human would see open space
-          nearby -- it just gets skipped rather than mis-drawn.
+          Most tracks are deliberately routed through the most open point of whichever pocket
+          connects their two ends -- worth the extra distance so the track actually passes
+          through the space, rather than just skirting its minimum-clearance edge. A track can
+          still fail to route if no two candidate points share a connected pocket at all.
         </div>
       </div>
 
