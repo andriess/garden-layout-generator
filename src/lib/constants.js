@@ -18,6 +18,13 @@ export const MIN_PEDESTRIAN_WIDTH_MM = 400;
 export const MIN_TILES_ACROSS = 2;
 
 // ============================================================
+// Meander tracks -- how far a point can sit from a track's centerline and still
+// count as "on" it. Shared by tile scatter tagging (paved) and the planting-pocket
+// obstacle footprint (both need the same "on the track" boundary).
+// ============================================================
+export const MEANDER_REACH_MM = 220;
+
+// ============================================================
 // Boundary repulsion -- default minimum distance any path/patio outline must keep from the
 // garden boundary edge (also used as the fallback when routing around a concave boundary
 // notch). User-adjustable via the "Boundary clearance" slider; this is just the initial value.
