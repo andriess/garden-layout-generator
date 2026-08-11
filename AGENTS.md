@@ -59,4 +59,12 @@ package.json) — don't assume one exists or invent a command for it.
   project sites (`https://<user>.github.io/<repo>/`) — do not change this to an absolute
   path or hardcode a repo name.
 - `.github/workflows/deploy.yml` builds and deploys to GitHub Pages automatically on
-  every push to `main` (Pages source = GitHub Actions). No manual deploy steps needed.
+  every push to `main`. Pages source = **branch** `gh-pages` (root) -- deployment pushes
+  the built `dist/` there with `keep_files: true` rather than using the
+  actions/deploy-pages "Actions" source, specifically so it doesn't clobber the PR
+  preview subfolders below. No manual deploy steps needed.
+- `.github/workflows/pr-preview.yml` deploys every PR to its own subfolder
+  (`pr-preview/pr-<n>/`) on the same `gh-pages` branch via `rossjrw/pr-preview-action`,
+  and removes it when the PR closes. Works with `base: "./"` unmodified since asset
+  paths are relative. GITHUB_TOKEN is read-only for `pull_request` events from forks, so
+  this only pushes previews for PRs opened from within the same repo.
