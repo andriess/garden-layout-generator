@@ -57,7 +57,7 @@ export default function PrintSheet({
 
         {paved.map((t, i) => (
           <polygon key={i} points={tileCornersFn(t.cx, t.cy).map((p) => p.join(",")).join(" ")}
-            fill={PALETTE[t.zoneIdx % PALETTE.length]} stroke={INK} strokeWidth={TILE_STROKE_MM} />
+            fill={PALETTE[0]} stroke={INK} strokeWidth={TILE_STROKE_MM} />
         ))}
 
         {exclusionZones.map((z) => (

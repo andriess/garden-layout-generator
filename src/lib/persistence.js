@@ -7,7 +7,7 @@
 
 export const BOUNDARY_FILE_TYPE = "garden-boundary";
 export const DESIGN_FILE_TYPE = "garden-design";
-export const FILE_FORMAT_VERSION = 3;
+export const FILE_FORMAT_VERSION = 4;
 
 // fields that make up "the site" -- boundary + house/exclusion footprint -- as opposed to
 // the rest of a design (tiles, paths, zones, scatter...) built on top of it
@@ -18,9 +18,10 @@ export const DESIGN_ONLY_FIELD_NAMES = [
   "tileShape", "paverAcrossFlats", "paverSize", "paverWidth", "paverHeight", "rectBond", "rotationDeg",
   "anchors", "connections",
   "meanderPaths", "meanderDensity", "meanderClearanceMm", "showMeander", "meanderSeed",
-  "zoneCount", "relaxIters", "wobbleMm", "seed",
+  "wobbleMm", "seed",
   "scatterDensity", "scatterMaxMm",
-  "showZones", "showTiles", "showBoundary", "showAnchors", "showCenterlines", "showPlanting",
+  "plantingDensity", "plantingClumpiness",
+  "showTiles", "showBoundary", "showAnchors", "showCenterlines", "showPlanting", "showPlantingAnchors",
   "showSettingOutGrid", "settingOutOriginCorner",
 ];
 
@@ -77,6 +78,13 @@ export async function readImportFile(file) {
 //
 // v2 -> v3: added the setting-out reference grid toggle + origin corner. Older files simply
 // never had an opinion on either, so they default off/top-left rather than being rejected.
+//
+// v3 -> v4: replaced the voronoi "zone" system (zoneCount/relaxIters/showZones -- a purely
+// cosmetic per-tile color tint with no effect on the paving itself) with pocket-aware
+// planting (plantingDensity/plantingClumpiness/showPlantingAnchors). There's no meaningful
+// way to derive a planting layout from the old zone fields, so older files just get
+// planting's own defaults; any zone fields they still carry are simply left unread from
+// here on.
 export function migrateDesignPayload(obj) {
   if (!obj || typeof obj !== "object" || obj.type !== DESIGN_FILE_TYPE) {
     return { payload: obj, notes: [] };
@@ -94,6 +102,16 @@ export function migrateDesignPayload(obj) {
 
   if (payload.showSettingOutGrid === undefined || payload.settingOutOriginCorner === undefined) {
     payload = { ...payload, showSettingOutGrid: payload.showSettingOutGrid ?? false, settingOutOriginCorner: payload.settingOutOriginCorner ?? "minXminY" };
+  }
+
+  if (payload.plantingDensity === undefined || payload.plantingClumpiness === undefined || payload.showPlantingAnchors === undefined) {
+    payload = {
+      ...payload,
+      plantingDensity: payload.plantingDensity ?? 30,
+      plantingClumpiness: payload.plantingClumpiness ?? 0.5,
+      showPlantingAnchors: payload.showPlantingAnchors ?? false,
+    };
+    notes.push('This file predates pocket-based planting -- planting density/clumpiness/anchor visibility were set to defaults. Any old zone/relaxation settings it had no longer apply.');
   }
 
   return { payload, notes };
