@@ -12,7 +12,7 @@ import {
   ANCHOR_DOOR_HALF_MM, ANCHOR_STROKE_MM, ANCHOR_JUNCTION_SIZE_MM, ANCHOR_PATIO_R_MM,
   ANCHOR_LABEL_OFFSET_MM, ANCHOR_LABEL_FONT_MM, MIN_VIEWPORT_WIDTH_MM, MAX_VIEWPORT_WIDTH_MM,
   LENGTH_LABEL_FONT_PX, LENGTH_INPUT_WIDTH_PX, LENGTH_INPUT_HEIGHT_PX,
-  DEFAULT_BOUNDARY_CLEARANCE_MM,
+  DEFAULT_BOUNDARY_CLEARANCE_MM, MEANDER_REACH_MM,
 } from "./lib/constants";
 import {
   mulberry32, polygonBBox, pointInPoly, pointSegDist, signedDistanceToPolygon, polygonCentroid,
@@ -26,6 +26,7 @@ import {
 } from "./lib/organicPaths";
 import { resizeSquareToSide, resizeRectToDims, resizeCircleToDiameter } from "./lib/shapeEdit";
 import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
+import { ringFromPoly, bufferPolylineToPolygon, differenceCell } from "./lib/polygonBoolean";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
 import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, migrateDesignPayload, validateImportPayload, maxIdSuffix } from "./lib/persistence";
 import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, WaypointRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
@@ -362,18 +363,20 @@ export default function GardenPavingDesigner() {
   // ---- tile paving selection: core (on path/patio) + scatter (fringe) ----
   // meander tracks: same organic routing as main paths, chained across the user's own
   // hand-placed waypoints instead of a pair of anchors -- see makeOrganicMultiWaypointPath.
+  // computed unconditionally -- showMeander only gates rendering (see the JSX below)
+  // and must NOT gate this geometry, since paved's tile tagging and the planting
+  // obstacle footprint both need the real track even while it's hidden on screen.
   const meanderTracks = useMemo(() => {
-    if (!hasBoundary || !showMeander || meanderPaths.length === 0) return [];
+    if (!hasBoundary || meanderPaths.length === 0) return [];
     const localRng = mulberry32(seed * 6089 + 29);
     return meanderPaths
       .filter((m) => m.waypoints.length >= 2)
       .map((m) => makeOrganicMultiWaypointPath(m.waypoints, wobbleMm, localRng, gardenBoundary, exclusionZones, meanderClearanceMm));
-  }, [hasBoundary, showMeander, meanderPaths, gardenBoundary, exclusionZones, meanderClearanceMm, wobbleMm, seed]);
+  }, [hasBoundary, meanderPaths, gardenBoundary, exclusionZones, meanderClearanceMm, wobbleMm, seed]);
 
   const paved = useMemo(() => {
     const scatterRng = mulberry32(seed * 7919 + 3);
     const meanderRng = mulberry32(meanderSeed * 3121 + 41);
-    const meanderReachMm = 220; // how far a tile can sit from a track's centerline and still qualify
     const result = [];
     for (const [cx, cy] of tileCenters) {
       let margin = -1e9;
@@ -407,7 +410,7 @@ export default function GardenPavingDesigner() {
             if (d < bestD) bestD = d;
           }
         }
-        if (bestD <= meanderReachMm && meanderRng() < meanderDensity * (1 - bestD / meanderReachMm)) {
+        if (bestD <= MEANDER_REACH_MM && meanderRng() < meanderDensity * (1 - bestD / MEANDER_REACH_MM)) {
           reason = "meander";
         }
       }
@@ -454,39 +457,69 @@ export default function GardenPavingDesigner() {
     return relaxPoints(pts, PLANTING_RELAX_ITERS, boundaryBBox);
   }, [plantingDensity, seed, boundaryBBox, gardenBoundary, exclusionZones, hasBoundary, nearPavedTile]);
 
-  const plantingCells = useMemo(
-    () => boundedVoronoiPolygons(plantingSeeds, boundaryBBox),
-    [plantingSeeds, boundaryBBox]
-  );
+  // obstacle footprint for planting cells -- always built from the real geometry
+  // (never gated by a show* toggle), so hiding a layer on screen never lets
+  // planting grow onto it. Patios/exclusion zones are already closed polygons;
+  // paths/meander tracks are centerline + width, buffered into a ribbon polygon.
+  const plantingObstaclePolygons = useMemo(() => {
+    const polys = [];
+    for (const z of exclusionZones) polys.push([ringFromPoly(z.poly)]);
+    for (const b of patioBlobs) polys.push([ringFromPoly(b.poly)]);
+    for (const p of pathPolys) {
+      const buffered = bufferPolylineToPolygon(p.poly, p.widthMm / 2);
+      if (buffered.length) polys.push(buffered);
+    }
+    for (const track of meanderTracks) {
+      const buffered = bufferPolylineToPolygon(track, MEANDER_REACH_MM);
+      if (buffered.length) polys.push(buffered);
+    }
+    return polys;
+  }, [exclusionZones, patioBlobs, pathPolys, meanderTracks]);
+
+  // each seed's raw bbox-clipped voronoi cell, then exactly clipped away from every
+  // obstacle -- an obstacle cutting through the middle of a cell can split it into
+  // multiple pieces, so each entry here is an array of polygons, not a single one.
+  const plantingCells = useMemo(() => {
+    const raw = boundedVoronoiPolygons(plantingSeeds, boundaryBBox);
+    return raw.map((poly) => (poly ? differenceCell(poly, plantingObstaclePolygons) : null));
+  }, [plantingSeeds, boundaryBBox, plantingObstaclePolygons]);
 
   // each voronoi cell is one "pocket" -- scatter a handful of small plant dots inside it
   // rather than a single dot per seed, so pockets read as naturalistic drifts/clumps of
   // planting instead of a sparse grid. Dot count scales with the cell's own area (bigger
   // pocket = more dots) and with the user's clumpiness setting (fuller vs. sparser drifts).
+  // A clipped cell may be several disjoint pieces (an obstacle cutting through its middle),
+  // so the target count is computed from the cell's total area, then split across pieces.
   const plantingDots = useMemo(() => {
     if (!hasBoundary) return [];
     const localRng = mulberry32(seed * 5231 + 13);
     const dots = [];
-    for (const poly of plantingCells) {
-      if (!poly || poly.length < 3) continue;
-      const area = Math.abs(polygonSignedArea(poly));
+    for (const pieces of plantingCells) {
+      if (!pieces || pieces.length === 0) continue;
+      const pieceAreas = pieces.map((poly) => Math.abs(polygonSignedArea(poly)));
+      const area = pieceAreas.reduce((s, a) => s + a, 0);
+      if (area <= 0) continue;
       const baseline = (area / PLANTING_AVG_DOT_AREA_MM2) * (0.4 + 1.2 * plantingClumpiness);
       const targetCount = Math.max(
         PLANTING_MIN_DOTS_PER_CELL,
         Math.min(PLANTING_MAX_DOTS_PER_CELL, Math.round(baseline))
       );
-      const cellBBox = polygonBBox(poly);
-      let placed = 0, attempts = 0;
-      while (placed < targetCount && attempts < targetCount * 40) {
-        attempts++;
-        const cand = [
-          cellBBox.xMin + localRng() * (cellBBox.xMax - cellBBox.xMin),
-          cellBBox.yMin + localRng() * (cellBBox.yMax - cellBBox.yMin),
-        ];
-        if (!pointInPoly(cand, poly)) continue;
-        if (nearPavedTile(cand)) continue;
-        dots.push(cand);
-        placed++;
+      for (let pi = 0; pi < pieces.length; pi++) {
+        const poly = pieces[pi];
+        const pieceTarget = Math.max(1, Math.round(targetCount * (pieceAreas[pi] / area)));
+        const cellBBox = polygonBBox(poly);
+        let placed = 0, attempts = 0;
+        while (placed < pieceTarget && attempts < pieceTarget * 40) {
+          attempts++;
+          const cand = [
+            cellBBox.xMin + localRng() * (cellBBox.xMax - cellBBox.xMin),
+            cellBBox.yMin + localRng() * (cellBBox.yMax - cellBBox.yMin),
+          ];
+          if (!pointInPoly(cand, poly)) continue;
+          if (nearPavedTile(cand)) continue;
+          dots.push(cand);
+          placed++;
+        }
       }
     }
     return dots;
@@ -1428,14 +1461,17 @@ export default function GardenPavingDesigner() {
               {/* planting pockets: each voronoi cell is the bed for one drift of a single
                   naturalistic-planting species -- the cell polygon itself is the plant area,
                   the stipple dots inside are just ground texture, not individual plants.
-                  Cell polygons aren't geometrically clipped around paved tiles/exclusion
-                  zones (no polygon-boolean lib in this codebase) -- instead they're drawn
-                  first, so the opaque tiles/exclusion hatching drawn afterward naturally
-                  covers any pocket-fill bleeding past a paver or house edge. */}
-              {showPlanting && plantingCells.map((poly, i) => poly && (
-                <polygon key={`pc${i}`} points={poly.map((p) => p.join(",")).join(" ")}
+                  Cells are geometrically clipped (polygon-clipping's difference) against
+                  every obstacle -- patios, paths, meander tracks, exclusion zones -- so an
+                  obstacle can split one cell into several pieces, rendered here separately.
+                  Still drawn first/underneath the tiles/exclusion hatching below as a
+                  fallback for the one case the clip doesn't cover: an obstacle fully
+                  enclosed inside a cell, touching none of its edges, comes back as a hole
+                  that this per-piece outer-ring rendering can't cut out. */}
+              {showPlanting && plantingCells.map((pieces, i) => pieces && pieces.map((poly, j) => poly && poly.length >= 3 && (
+                <polygon key={`pc${i}-${j}`} points={poly.map((p) => p.join(",")).join(" ")}
                   fill="#8FA07A" fillOpacity={0.22} stroke="#5F7050" strokeWidth={PLANTING_CELL_STROKE_MM} strokeOpacity={0.55} />
-              ))}
+              )))}
               {showPlanting && plantingDots.map(([px, py], i) => (
                 <circle key={i} cx={px} cy={py} r={PLANTING_DOT_R_MM} fill="#8FA07A" opacity={0.35} />
               ))}
