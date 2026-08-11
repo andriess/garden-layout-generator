@@ -1298,7 +1298,7 @@ export default function GardenPavingDesigner() {
         </Section>
 
         <Section title="Planting">
-          <Row label={`Planting density (${plantingDensity})`}><input type="range" min={10} max={80} value={plantingDensity} onChange={(e) => setPlantingDensity(+e.target.value)} style={{ width: "100%" }} /></Row>
+          <Row label={`Planting density (${plantingDensity})`}><input type="range" min={10} max={200} value={plantingDensity} onChange={(e) => setPlantingDensity(+e.target.value)} style={{ width: "100%" }} /></Row>
           <Row label={`Clumpiness (${plantingClumpiness.toFixed(2)})`}><input type="range" min={0} max={1} step={0.05} value={plantingClumpiness} onChange={(e) => setPlantingClumpiness(+e.target.value)} style={{ width: "100%" }} /></Row>
         </Section>
 
