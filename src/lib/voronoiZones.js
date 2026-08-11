@@ -4,15 +4,10 @@
 import { Delaunay } from "d3-delaunay";
 import { polygonCentroid } from "./geometryUtils";
 
-// `extraSites` are additional Delaunay sites that take part in the tessellation --
-// pushing the returned cells' boundaries away from them exactly the way a real
-// neighboring seed would -- but whose own cells are never returned. Used to make
-// planting cells treat a paver/obstacle as if it were a neighboring cell, instead
-// of clipping the cell polygon against the obstacle's shape after the fact.
-export function boundedVoronoiPolygons(points, bounds, extraSites = []) {
+export function boundedVoronoiPolygons(points, bounds) {
   const { xMin, xMax, yMin, yMax } = bounds;
   const n = points.length;
-  const all = [...points, ...extraSites];
+  const all = [...points];
   for (const [x, y] of points) all.push([2 * xMin - x, y]);
   for (const [x, y] of points) all.push([2 * xMax - x, y]);
   for (const [x, y] of points) all.push([x, 2 * yMin - y]);
@@ -27,10 +22,10 @@ export function boundedVoronoiPolygons(points, bounds, extraSites = []) {
   return polys;
 }
 
-export function relaxPoints(points, iters, bounds, extraSites = []) {
+export function relaxPoints(points, iters, bounds) {
   let pts = points;
   for (let it = 0; it < iters; it++) {
-    const polys = boundedVoronoiPolygons(pts, bounds, extraSites);
+    const polys = boundedVoronoiPolygons(pts, bounds);
     pts = pts.map((p, i) => {
       const poly = polys[i];
       if (!poly) return p;
