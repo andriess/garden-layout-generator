@@ -4,7 +4,8 @@ import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square, Link2, Max
 
 import {
   PALETTE, INK, INK_SOFT, PAPER, PANEL_BORDER, APP_BG, PLANT_BG, ACCENT,
-  HATCH_CELL_MM, HATCH_LINE_MM, PLANTING_DOT_R_MM, TILE_STROKE_MM, CENTERLINE_STROKE_MM,
+  HATCH_CELL_MM, HATCH_LINE_MM, PLANTING_DOT_R_MM, PLANTING_ANCHOR_R_MM, PLANTING_ANCHOR_STROKE_MM,
+  PLANTING_CELL_STROKE_MM, TILE_STROKE_MM, CENTERLINE_STROKE_MM,
   MEANDER_STROKE_MM, EXCLUSION_STROKE_MM, EXCLUSION_LABEL_FONT_MM, BOUNDARY_STROKE_MM,
   BOUNDARY_DASH_MM, DRAW_PREVIEW_STROKE_MM, DRAW_POINT_R_MM, DRAW_POINT_STROKE_MM,
   CONNECT_PREVIEW_STROKE_MM, ANCHOR_SELECT_RING_R_MM, ANCHOR_SELECT_RING_STROKE_MM,
@@ -15,7 +16,7 @@ import {
 } from "./lib/constants";
 import {
   mulberry32, polygonBBox, pointInPoly, pointSegDist, signedDistanceToPolygon, polygonCentroid,
-  polygonEdgeLengths, polylineSegmentLengths, pointAtDistance, closestPointOnPolyline,
+  polygonEdgeLengths, polylineSegmentLengths, pointAtDistance, closestPointOnPolyline, polygonSignedArea,
 } from "./lib/geometryUtils";
 import { hexSizeFromPaver, hexCorners, makeHexGrid, squareCorners, rectCorners, makeRectGrid } from "./lib/tileGrids";
 import { deriveSettingOutSpacing, originCornerPoint, computeSettingOutGrid } from "./lib/settingOutGrid";
@@ -45,6 +46,15 @@ const HANDLE_STROKE_PX = 2;
 const SELECTION_STROKE_PX = 2.5;
 const SELECTION_DASH_PX = [8, 5];
 const WHEEL_ZOOM_SENSITIVITY = 0.0015;
+
+// Naturalistic planting pockets -- seeded/relaxed the same way the old zone system was, but
+// rejecting candidates that land on paved ground so plants only fill the gaps paving left
+// behind. Relaxation iterations and the paver clearance margin are fixed rather than exposed
+// as sliders (density and clumpiness are the two knobs users actually want to tweak).
+const PLANTING_RELAX_ITERS = 2;
+const PLANTING_MIN_DOTS_PER_CELL = 2;
+const PLANTING_MAX_DOTS_PER_CELL = 10;
+const PLANTING_AVG_DOT_AREA_MM2 = 2_000_000; // ~2 m^2 of pocket per dot at clumpiness 1.0
 
 export default function GardenPavingDesigner() {
   // --- garden ---
@@ -112,9 +122,7 @@ export default function GardenPavingDesigner() {
   const [showMeander, setShowMeander] = useState(true);
   const [meanderSeed, setMeanderSeed] = useState(1);
 
-  // --- zones / organics ---
-  const [zoneCount, setZoneCount] = useState(30);
-  const [relaxIters, setRelaxIters] = useState(1);
+  // --- paving / organics ---
   const [wobbleMm, setWobbleMm] = useState(450);
   const [seed, setSeed] = useState(7);
 
@@ -122,13 +130,18 @@ export default function GardenPavingDesigner() {
   const [scatterDensity, setScatterDensity] = useState(0.7);
   const [scatterMaxMm, setScatterMaxMm] = useState(700);
 
+  // --- planting: naturalistic pocket fill, computed from the unpaved gaps left after
+  // paving is laid out (see the plantingSeeds/plantingCells/plantingDots pipeline below) ---
+  const [plantingDensity, setPlantingDensity] = useState(30); // target pocket/seed count
+  const [plantingClumpiness, setPlantingClumpiness] = useState(0.5); // 0-1: how many dots fill each pocket
+
   // --- layer toggles ---
-  const [showZones, setShowZones] = useState(true);
   const [showTiles, setShowTiles] = useState(true);
   const [showBoundary, setShowBoundary] = useState(true);
   const [showAnchors, setShowAnchors] = useState(true);
   const [showCenterlines, setShowCenterlines] = useState(true);
   const [showPlanting, setShowPlanting] = useState(true);
+  const [showPlantingAnchors, setShowPlantingAnchors] = useState(false); // reference dot at each pocket's voronoi seed
 
   // --- setting-out reference grid: a dimensioned measurement overlay a tiler can use to
   // locate rows/courses on site, independent of the tile grid rendering itself ---
@@ -346,26 +359,6 @@ export default function GardenPavingDesigner() {
     return { pathPolys: polys, clampReport: report, patioBlobs: blobs, exclusionWarnings: warnings };
   }, [connections, anchorById, wobbleMm, seed, gardenBoundary, geom.acrossMm, anchors, exclusionZones, hasBoundary, boundaryClearanceMm]);
 
-  // ---- zones ----
-  const zoneSeeds = useMemo(() => {
-    if (!hasBoundary) return [];
-    const localRng = mulberry32(seed * 131 + 5);
-    const pts = [];
-    let attempts = 0;
-    while (pts.length < zoneCount && attempts < zoneCount * 60) {
-      attempts++;
-      const cand = [
-        boundaryBBox.xMin + localRng() * (boundaryBBox.xMax - boundaryBBox.xMin),
-        boundaryBBox.yMin + localRng() * (boundaryBBox.yMax - boundaryBBox.yMin),
-      ];
-      if (pointInPoly(cand, gardenBoundary) && !exclusionZones.some((z) => pointInPoly(cand, z.poly))) pts.push(cand);
-    }
-    return relaxPoints(pts, relaxIters, boundaryBBox);
-  }, [zoneCount, relaxIters, seed, boundaryBBox, gardenBoundary, exclusionZones, hasBoundary]);
-
-  const zoneDelaunay = useMemo(() => Delaunay.from(zoneSeeds.length ? zoneSeeds : [[0, 0]]), [zoneSeeds]);
-  const zonePolys = useMemo(() => boundedVoronoiPolygons(zoneSeeds, boundaryBBox), [zoneSeeds, boundaryBBox]);
-
   // ---- tile paving selection: core (on path/patio) + scatter (fringe) ----
   // meander tracks: same organic routing as main paths, chained across the user's own
   // hand-placed waypoints instead of a pair of anchors -- see makeOrganicMultiWaypointPath.
@@ -418,19 +411,86 @@ export default function GardenPavingDesigner() {
           reason = "meander";
         }
       }
-      if (reason) {
-        const idx = zoneDelaunay.find(cx, cy);
-        result.push({ cx, cy, reason, zoneIdx: idx });
-      }
+      if (reason) result.push({ cx, cy, reason });
     }
     return result;
-  }, [tileCenters, pathPolys, patioBlobs, scatterMaxMm, scatterDensity, seed, zoneDelaunay, meanderTracks, meanderDensity, meanderSeed]);
+  }, [tileCenters, pathPolys, patioBlobs, scatterMaxMm, scatterDensity, seed, meanderTracks, meanderDensity, meanderSeed]);
 
-  const materialCounts = useMemo(() => {
-    const counts = new Array(PALETTE.length).fill(0);
-    for (const t of paved) counts[t.zoneIdx % PALETTE.length]++;
-    return counts;
-  }, [paved]);
+  // ---- planting pockets: naturalistic fill for the ground paving left uncovered ----
+  // Nearest-paved-tile lookup, so candidate planting points can reject ones that land on
+  // (or right next to) a paver -- same distance-threshold approach as the scatter/meander
+  // margins above, just against the paved tile set instead of a path/patio polygon.
+  const pavedDelaunay = useMemo(
+    () => (paved.length ? Delaunay.from(paved.map((t) => [t.cx, t.cy])) : null),
+    [paved]
+  );
+  const pavedClearanceMm = geom.acrossMm * 0.65;
+
+  const nearPavedTile = useCallback((pt) => {
+    if (!pavedDelaunay) return false;
+    const t = paved[pavedDelaunay.find(pt[0], pt[1])];
+    return Math.hypot(pt[0] - t.cx, pt[1] - t.cy) < pavedClearanceMm;
+  }, [pavedDelaunay, paved, pavedClearanceMm]);
+
+  // seed points: rejection-sampled across the boundary (same pattern the old zone seeding
+  // used), additionally rejecting anything that landed on paved ground, then Lloyd-relaxed
+  // so the pockets end up evenly spread rather than clumped by sampling luck
+  const plantingSeeds = useMemo(() => {
+    if (!hasBoundary) return [];
+    const localRng = mulberry32(seed * 131 + 5);
+    const pts = [];
+    let attempts = 0;
+    while (pts.length < plantingDensity && attempts < plantingDensity * 60) {
+      attempts++;
+      const cand = [
+        boundaryBBox.xMin + localRng() * (boundaryBBox.xMax - boundaryBBox.xMin),
+        boundaryBBox.yMin + localRng() * (boundaryBBox.yMax - boundaryBBox.yMin),
+      ];
+      if (!pointInPoly(cand, gardenBoundary)) continue;
+      if (exclusionZones.some((z) => pointInPoly(cand, z.poly))) continue;
+      if (nearPavedTile(cand)) continue;
+      pts.push(cand);
+    }
+    return relaxPoints(pts, PLANTING_RELAX_ITERS, boundaryBBox);
+  }, [plantingDensity, seed, boundaryBBox, gardenBoundary, exclusionZones, hasBoundary, nearPavedTile]);
+
+  const plantingCells = useMemo(
+    () => boundedVoronoiPolygons(plantingSeeds, boundaryBBox),
+    [plantingSeeds, boundaryBBox]
+  );
+
+  // each voronoi cell is one "pocket" -- scatter a handful of small plant dots inside it
+  // rather than a single dot per seed, so pockets read as naturalistic drifts/clumps of
+  // planting instead of a sparse grid. Dot count scales with the cell's own area (bigger
+  // pocket = more dots) and with the user's clumpiness setting (fuller vs. sparser drifts).
+  const plantingDots = useMemo(() => {
+    if (!hasBoundary) return [];
+    const localRng = mulberry32(seed * 5231 + 13);
+    const dots = [];
+    for (const poly of plantingCells) {
+      if (!poly || poly.length < 3) continue;
+      const area = Math.abs(polygonSignedArea(poly));
+      const baseline = (area / PLANTING_AVG_DOT_AREA_MM2) * (0.4 + 1.2 * plantingClumpiness);
+      const targetCount = Math.max(
+        PLANTING_MIN_DOTS_PER_CELL,
+        Math.min(PLANTING_MAX_DOTS_PER_CELL, Math.round(baseline))
+      );
+      const cellBBox = polygonBBox(poly);
+      let placed = 0, attempts = 0;
+      while (placed < targetCount && attempts < targetCount * 40) {
+        attempts++;
+        const cand = [
+          cellBBox.xMin + localRng() * (cellBBox.xMax - cellBBox.xMin),
+          cellBBox.yMin + localRng() * (cellBBox.yMax - cellBBox.yMin),
+        ];
+        if (!pointInPoly(cand, poly)) continue;
+        if (nearPavedTile(cand)) continue;
+        dots.push(cand);
+        placed++;
+      }
+    }
+    return dots;
+  }, [plantingCells, seed, plantingClumpiness, hasBoundary, nearPavedTile]);
 
   // ---- vector point editing: which polygons are selectable, and hit-testing against them ----
   const editablePolys = useMemo(() => {
@@ -853,9 +913,10 @@ export default function GardenPavingDesigner() {
       tileShape, paverAcrossFlats, paverSize, paverWidth, paverHeight, rectBond, rotationDeg,
       anchors, connections,
       meanderPaths, meanderDensity, meanderClearanceMm, showMeander, meanderSeed,
-      zoneCount, relaxIters, wobbleMm, seed,
+      wobbleMm, seed,
       scatterDensity, scatterMaxMm,
-      showZones, showTiles, showBoundary, showAnchors, showCenterlines, showPlanting,
+      plantingDensity, plantingClumpiness,
+      showTiles, showBoundary, showAnchors, showCenterlines, showPlanting, showPlantingAnchors,
       showSettingOutGrid, settingOutOriginCorner,
     }), `garden-design-${Date.now()}.json`);
   };
@@ -935,18 +996,18 @@ export default function GardenPavingDesigner() {
       setMeanderClearanceMm(payload.meanderClearanceMm);
       setShowMeander(payload.showMeander);
       setMeanderSeed(payload.meanderSeed);
-      setZoneCount(payload.zoneCount);
-      setRelaxIters(payload.relaxIters);
       setWobbleMm(payload.wobbleMm);
       setSeed(payload.seed);
       setScatterDensity(payload.scatterDensity);
       setScatterMaxMm(payload.scatterMaxMm);
-      setShowZones(payload.showZones);
+      setPlantingDensity(payload.plantingDensity);
+      setPlantingClumpiness(payload.plantingClumpiness);
       setShowTiles(payload.showTiles);
       setShowBoundary(payload.showBoundary);
       setShowAnchors(payload.showAnchors);
       setShowCenterlines(payload.showCenterlines);
       setShowPlanting(payload.showPlanting);
+      setShowPlantingAnchors(payload.showPlantingAnchors);
       setShowSettingOutGrid(payload.showSettingOutGrid);
       setSettingOutOriginCorner(payload.settingOutOriginCorner);
       bumpUidCounterPast([...payload.exclusionZones.map((z) => z.id), ...payload.anchors.map((a) => a.id), ...payload.meanderPaths.map((m) => m.id)]);
@@ -978,7 +1039,7 @@ export default function GardenPavingDesigner() {
           Garden Paving Designer
         </div>
         <div style={{ fontSize: 11.5, color: INK_SOFT, marginBottom: 18 }}>
-          Voronoi zones · organic paths · live tile layout
+          Naturalistic planting · organic paths · live tile layout
         </div>
 
         <Section title="Save / load">
@@ -1227,15 +1288,18 @@ export default function GardenPavingDesigner() {
           </button>
         </Section>
 
-        <Section title="Organic zones">
-          <Row label={`Zones (${zoneCount})`}><input type="range" min={6} max={80} value={zoneCount} onChange={(e) => setZoneCount(+e.target.value)} style={{ width: "100%" }} /></Row>
-          <Row label={`Relaxation (${relaxIters})`}><input type="range" min={0} max={4} value={relaxIters} onChange={(e) => setRelaxIters(+e.target.value)} style={{ width: "100%" }} /></Row>
+        <Section title="Paving">
           <Row label={`Path wobble (${wobbleMm}mm)`}><input type="range" min={0} max={1200} step={50} value={wobbleMm} onChange={(e) => setWobbleMm(+e.target.value)} style={{ width: "100%" }} /></Row>
           <Row label={`Scatter density (${scatterDensity.toFixed(2)})`}><input type="range" min={0} max={1} step={0.05} value={scatterDensity} onChange={(e) => setScatterDensity(+e.target.value)} style={{ width: "100%" }} /></Row>
           <Row label={`Scatter reach (${scatterMaxMm}mm)`}><input type="range" min={0} max={1500} step={50} value={scatterMaxMm} onChange={(e) => setScatterMaxMm(+e.target.value)} style={{ width: "100%" }} /></Row>
           <button onClick={() => setSeed((s) => s + 1)} style={{ ...primaryBtnStyle, width: "100%", marginTop: 6, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
             <RefreshCw size={13} /> Reroll layout
           </button>
+        </Section>
+
+        <Section title="Planting">
+          <Row label={`Planting density (${plantingDensity})`}><input type="range" min={10} max={80} value={plantingDensity} onChange={(e) => setPlantingDensity(+e.target.value)} style={{ width: "100%" }} /></Row>
+          <Row label={`Clumpiness (${plantingClumpiness.toFixed(2)})`}><input type="range" min={0} max={1} step={0.05} value={plantingClumpiness} onChange={(e) => setPlantingClumpiness(+e.target.value)} style={{ width: "100%" }} /></Row>
         </Section>
 
         <Section title="Meander (desire) tracks">
@@ -1289,8 +1353,8 @@ export default function GardenPavingDesigner() {
 
         <Section title="Layers">
           <Toggle label="Planting texture" value={showPlanting} onChange={setShowPlanting} />
+          <Toggle label="Planting anchors" value={showPlantingAnchors} onChange={setShowPlantingAnchors} />
           <Toggle label="Boundary" value={showBoundary} onChange={setShowBoundary} />
-          <Toggle label="Zone guide" value={showZones} onChange={setShowZones} />
           <Toggle label="Tiles" value={showTiles} onChange={setShowTiles} />
           <Toggle label="Path/patio centerlines" value={showCenterlines} onChange={setShowCenterlines} />
           <Toggle label="Meander tracks" value={showMeander} onChange={setShowMeander} />
@@ -1329,14 +1393,6 @@ export default function GardenPavingDesigner() {
           <Stat label="Meander" value={`${meanderTileCount} (${meanderPaths.length} tracks)`} />
           <Stat label="Coverage" value={`${totalGardenTiles ? Math.round((100 * (coreCount + scatterCount + meanderTileCount)) / totalGardenTiles) : 0}%`} />
           <div style={{ flex: 1 }} />
-          <div style={{ display: "flex", gap: 10 }}>
-            {PALETTE.map((c, i) => materialCounts[i] > 0 && (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10.5, color: INK_SOFT }}>
-                <span style={{ width: 9, height: 9, background: c, display: "inline-block", borderRadius: 2 }} />
-                {materialCounts[i]}
-              </div>
-            ))}
-          </div>
           <button onClick={fitView} disabled={!hasBoundary} title="Fit view to boundary"
             style={{ ...iconBtnStyle, opacity: hasBoundary ? 1 : 0.35, cursor: hasBoundary ? "pointer" : "not-allowed" }}>
             <Maximize2 size={15} />
@@ -1369,19 +1425,27 @@ export default function GardenPavingDesigner() {
             </defs>
 
             <g clipPath="url(#gardenClip)">
-              {showPlanting && Array.from({ length: 260 }).map((_, i) => {
-                const rx = boundaryBBox.xMin + ((i * 97) % (boundaryBBox.xMax - boundaryBBox.xMin));
-                const ry = boundaryBBox.yMin + ((i * 233) % (boundaryBBox.yMax - boundaryBBox.yMin));
-                return <circle key={i} cx={rx} cy={ry} r={PLANTING_DOT_R_MM} fill="#8FA07A" opacity={0.35} />;
-              })}
-
-              {showZones && zonePolys.map((poly, i) => poly && (
-                <polygon key={i} points={poly.map((p) => p.join(",")).join(" ")} fill={PALETTE[i % PALETTE.length]} opacity={0.1} stroke="none" />
+              {/* planting pockets: each voronoi cell is the bed for one drift of a single
+                  naturalistic-planting species -- the cell polygon itself is the plant area,
+                  the stipple dots inside are just ground texture, not individual plants.
+                  Cell polygons aren't geometrically clipped around paved tiles/exclusion
+                  zones (no polygon-boolean lib in this codebase) -- instead they're drawn
+                  first, so the opaque tiles/exclusion hatching drawn afterward naturally
+                  covers any pocket-fill bleeding past a paver or house edge. */}
+              {showPlanting && plantingCells.map((poly, i) => poly && (
+                <polygon key={`pc${i}`} points={poly.map((p) => p.join(",")).join(" ")}
+                  fill="#8FA07A" fillOpacity={0.22} stroke="#5F7050" strokeWidth={PLANTING_CELL_STROKE_MM} strokeOpacity={0.55} />
+              ))}
+              {showPlanting && plantingDots.map(([px, py], i) => (
+                <circle key={i} cx={px} cy={py} r={PLANTING_DOT_R_MM} fill="#8FA07A" opacity={0.35} />
+              ))}
+              {showPlantingAnchors && plantingSeeds.map(([sx, sy], i) => (
+                <circle key={`pa${i}`} cx={sx} cy={sy} r={PLANTING_ANCHOR_R_MM} fill="none" stroke={INK_SOFT} strokeWidth={PLANTING_ANCHOR_STROKE_MM} opacity={0.8} />
               ))}
 
               {showTiles && paved.map((t, i) => (
                 <polygon key={i} points={tileCornersFn(t.cx, t.cy).map((p) => p.join(",")).join(" ")}
-                  fill={PALETTE[t.zoneIdx % PALETTE.length]} stroke={INK} strokeWidth={TILE_STROKE_MM} opacity={t.reason === "core" ? 1 : 0.92} />
+                  fill={PALETTE[0]} stroke={INK} strokeWidth={TILE_STROKE_MM} opacity={t.reason === "core" ? 1 : 0.92} />
               ))}
 
               {/* main path/patio centerlines moved INSIDE the clip group -- these are the
