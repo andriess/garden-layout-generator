@@ -26,7 +26,6 @@ import {
 } from "./lib/organicPaths";
 import { resizeSquareToSide, resizeRectToDims, resizeCircleToDiameter } from "./lib/shapeEdit";
 import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
-import { ringFromPoly, bufferPolylineToPolygon, differenceCell } from "./lib/polygonBoolean";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
 import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, migrateDesignPayload, validateImportPayload, maxIdSuffix } from "./lib/persistence";
 import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, WaypointRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
@@ -435,9 +434,36 @@ export default function GardenPavingDesigner() {
     return Math.hypot(pt[0] - t.cx, pt[1] - t.cy) < pavedClearanceMm;
   }, [pavedDelaunay, paved, pavedClearanceMm]);
 
+  // "Neighbor" sites for the planting tessellation -- every paved tile center and a
+  // sampling of points along each exclusion zone's edge, fed into the same Voronoi
+  // computation as extra Delaunay sites (see boundedVoronoiPolygons). A planting
+  // seed's cell boundary against a paver falls out of the same equidistant-bisector
+  // math it already uses against a real neighboring seed, rather than being clipped
+  // to the paver's outline after the fact -- so a close seed hugs a paver tightly and
+  // a farther one leaves more of a gap, the same way two planting cells would settle
+  // against each other. Always built from the real geometry (never gated by a show*
+  // toggle), so hiding a layer on screen never lets planting grow onto it.
+  const plantingPhantomSites = useMemo(() => {
+    const sites = paved.map((t) => [t.cx, t.cy]);
+    const spacing = Math.max(geom.acrossMm, 300);
+    for (const z of exclusionZones) {
+      const poly = z.poly;
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i], b = poly[(i + 1) % poly.length];
+        const steps = Math.max(1, Math.round(Math.hypot(b[0] - a[0], b[1] - a[1]) / spacing));
+        for (let s = 0; s < steps; s++) {
+          const t = s / steps;
+          sites.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+        }
+      }
+    }
+    return sites;
+  }, [paved, exclusionZones, geom.acrossMm]);
+
   // seed points: rejection-sampled across the boundary (same pattern the old zone seeding
   // used), additionally rejecting anything that landed on paved ground, then Lloyd-relaxed
-  // so the pockets end up evenly spread rather than clumped by sampling luck
+  // (against the same phantom sites, so a seed doesn't relax toward sitting flush against
+  // a paver either) so the pockets end up evenly spread rather than clumped by sampling luck
   const plantingSeeds = useMemo(() => {
     if (!hasBoundary) return [];
     const localRng = mulberry32(seed * 131 + 5);
@@ -454,72 +480,44 @@ export default function GardenPavingDesigner() {
       if (nearPavedTile(cand)) continue;
       pts.push(cand);
     }
-    return relaxPoints(pts, PLANTING_RELAX_ITERS, boundaryBBox);
-  }, [plantingDensity, seed, boundaryBBox, gardenBoundary, exclusionZones, hasBoundary, nearPavedTile]);
+    return relaxPoints(pts, PLANTING_RELAX_ITERS, boundaryBBox, plantingPhantomSites);
+  }, [plantingDensity, seed, boundaryBBox, gardenBoundary, exclusionZones, hasBoundary, nearPavedTile, plantingPhantomSites]);
 
-  // obstacle footprint for planting cells -- always built from the real geometry
-  // (never gated by a show* toggle), so hiding a layer on screen never lets
-  // planting grow onto it. Patios/exclusion zones are already closed polygons;
-  // paths/meander tracks are centerline + width, buffered into a ribbon polygon.
-  const plantingObstaclePolygons = useMemo(() => {
-    const polys = [];
-    for (const z of exclusionZones) polys.push([ringFromPoly(z.poly)]);
-    for (const b of patioBlobs) polys.push([ringFromPoly(b.poly)]);
-    for (const p of pathPolys) {
-      const buffered = bufferPolylineToPolygon(p.poly, p.widthMm / 2);
-      if (buffered.length) polys.push(buffered);
-    }
-    for (const track of meanderTracks) {
-      const buffered = bufferPolylineToPolygon(track, MEANDER_REACH_MM);
-      if (buffered.length) polys.push(buffered);
-    }
-    return polys;
-  }, [exclusionZones, patioBlobs, pathPolys, meanderTracks]);
-
-  // each seed's raw bbox-clipped voronoi cell, then exactly clipped away from every
-  // obstacle -- an obstacle cutting through the middle of a cell can split it into
-  // multiple pieces, so each entry here is an array of polygons, not a single one.
-  const plantingCells = useMemo(() => {
-    const raw = boundedVoronoiPolygons(plantingSeeds, boundaryBBox);
-    return raw.map((poly) => (poly ? differenceCell(poly, plantingObstaclePolygons) : null));
-  }, [plantingSeeds, boundaryBBox, plantingObstaclePolygons]);
+  // each seed's cell, bounded the same way against every paver/exclusion-zone phantom
+  // site as it is against a real neighboring seed -- see plantingPhantomSites above.
+  const plantingCells = useMemo(
+    () => boundedVoronoiPolygons(plantingSeeds, boundaryBBox, plantingPhantomSites),
+    [plantingSeeds, boundaryBBox, plantingPhantomSites]
+  );
 
   // each voronoi cell is one "pocket" -- scatter a handful of small plant dots inside it
   // rather than a single dot per seed, so pockets read as naturalistic drifts/clumps of
   // planting instead of a sparse grid. Dot count scales with the cell's own area (bigger
   // pocket = more dots) and with the user's clumpiness setting (fuller vs. sparser drifts).
-  // A clipped cell may be several disjoint pieces (an obstacle cutting through its middle),
-  // so the target count is computed from the cell's total area, then split across pieces.
   const plantingDots = useMemo(() => {
     if (!hasBoundary) return [];
     const localRng = mulberry32(seed * 5231 + 13);
     const dots = [];
-    for (const pieces of plantingCells) {
-      if (!pieces || pieces.length === 0) continue;
-      const pieceAreas = pieces.map((poly) => Math.abs(polygonSignedArea(poly)));
-      const area = pieceAreas.reduce((s, a) => s + a, 0);
-      if (area <= 0) continue;
+    for (const poly of plantingCells) {
+      if (!poly || poly.length < 3) continue;
+      const area = Math.abs(polygonSignedArea(poly));
       const baseline = (area / PLANTING_AVG_DOT_AREA_MM2) * (0.4 + 1.2 * plantingClumpiness);
       const targetCount = Math.max(
         PLANTING_MIN_DOTS_PER_CELL,
         Math.min(PLANTING_MAX_DOTS_PER_CELL, Math.round(baseline))
       );
-      for (let pi = 0; pi < pieces.length; pi++) {
-        const poly = pieces[pi];
-        const pieceTarget = Math.max(1, Math.round(targetCount * (pieceAreas[pi] / area)));
-        const cellBBox = polygonBBox(poly);
-        let placed = 0, attempts = 0;
-        while (placed < pieceTarget && attempts < pieceTarget * 40) {
-          attempts++;
-          const cand = [
-            cellBBox.xMin + localRng() * (cellBBox.xMax - cellBBox.xMin),
-            cellBBox.yMin + localRng() * (cellBBox.yMax - cellBBox.yMin),
-          ];
-          if (!pointInPoly(cand, poly)) continue;
-          if (nearPavedTile(cand)) continue;
-          dots.push(cand);
-          placed++;
-        }
+      const cellBBox = polygonBBox(poly);
+      let placed = 0, attempts = 0;
+      while (placed < targetCount && attempts < targetCount * 40) {
+        attempts++;
+        const cand = [
+          cellBBox.xMin + localRng() * (cellBBox.xMax - cellBBox.xMin),
+          cellBBox.yMin + localRng() * (cellBBox.yMax - cellBBox.yMin),
+        ];
+        if (!pointInPoly(cand, poly)) continue;
+        if (nearPavedTile(cand)) continue;
+        dots.push(cand);
+        placed++;
       }
     }
     return dots;
@@ -1461,17 +1459,17 @@ export default function GardenPavingDesigner() {
               {/* planting pockets: each voronoi cell is the bed for one drift of a single
                   naturalistic-planting species -- the cell polygon itself is the plant area,
                   the stipple dots inside are just ground texture, not individual plants.
-                  Cells are geometrically clipped (polygon-clipping's difference) against
-                  every obstacle -- patios, paths, meander tracks, exclusion zones -- so an
-                  obstacle can split one cell into several pieces, rendered here separately.
-                  Still drawn first/underneath the tiles/exclusion hatching below as a
-                  fallback for the one case the clip doesn't cover: an obstacle fully
-                  enclosed inside a cell, touching none of its edges, comes back as a hole
-                  that this per-piece outer-ring rendering can't cut out. */}
-              {showPlanting && plantingCells.map((pieces, i) => pieces && pieces.map((poly, j) => poly && poly.length >= 3 && (
-                <polygon key={`pc${i}-${j}`} points={poly.map((p) => p.join(",")).join(" ")}
+                  A cell's edge against a paver or exclusion zone is an ordinary Voronoi
+                  bisector against a phantom site (see plantingPhantomSites), the same math
+                  that already separates it from a real neighboring cell -- not a clip
+                  against the obstacle's outline. That means it's not a hard geometric
+                  guarantee against overlap the way a clip would be (a seed far from any
+                  paver could still bulge slightly past one), so this is still drawn
+                  first/underneath the tiles/exclusion hatching below as a visual backstop. */}
+              {showPlanting && plantingCells.map((poly, i) => poly && (
+                <polygon key={`pc${i}`} points={poly.map((p) => p.join(",")).join(" ")}
                   fill="#8FA07A" fillOpacity={0.22} stroke="#5F7050" strokeWidth={PLANTING_CELL_STROKE_MM} strokeOpacity={0.55} />
-              )))}
+              ))}
               {showPlanting && plantingDots.map(([px, py], i) => (
                 <circle key={i} cx={px} cy={py} r={PLANTING_DOT_R_MM} fill="#8FA07A" opacity={0.35} />
               ))}
