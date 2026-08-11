@@ -7,7 +7,7 @@
 
 export const BOUNDARY_FILE_TYPE = "garden-boundary";
 export const DESIGN_FILE_TYPE = "garden-design";
-export const FILE_FORMAT_VERSION = 2;
+export const FILE_FORMAT_VERSION = 3;
 
 // fields that make up "the site" -- boundary + house/exclusion footprint -- as opposed to
 // the rest of a design (tiles, paths, zones, scatter...) built on top of it
@@ -21,6 +21,7 @@ export const DESIGN_ONLY_FIELD_NAMES = [
   "zoneCount", "relaxIters", "wobbleMm", "seed",
   "scatterDensity", "scatterMaxMm",
   "showZones", "showTiles", "showBoundary", "showAnchors", "showCenterlines", "showPlanting",
+  "showSettingOutGrid", "settingOutOriginCorner",
 ];
 
 export const DESIGN_FIELD_NAMES = [...BOUNDARY_FIELD_NAMES, ...DESIGN_ONLY_FIELD_NAMES];
@@ -73,17 +74,29 @@ export async function readImportFile(file) {
 // generate and a seed to regenerate them with an algorithm that no longer exists. The honest
 // migration is dropping them and telling the user, not fabricating waypoints that were never
 // there.
+//
+// v2 -> v3: added the setting-out reference grid toggle + origin corner. Older files simply
+// never had an opinion on either, so they default off/top-left rather than being rejected.
 export function migrateDesignPayload(obj) {
-  if (!obj || typeof obj !== "object" || obj.type !== DESIGN_FILE_TYPE || Array.isArray(obj.meanderPaths)) {
+  if (!obj || typeof obj !== "object" || obj.type !== DESIGN_FILE_TYPE) {
     return { payload: obj, notes: [] };
   }
-  const oldCount = typeof obj.meanderCount === "number" ? obj.meanderCount : null;
-  const trackWord = oldCount === 1 ? "track" : "tracks";
-  const countPhrase = oldCount === null ? "any auto-generated meander tracks" : `its ${oldCount} auto-generated meander ${trackWord}`;
-  return {
-    payload: { ...obj, meanderPaths: [] },
-    notes: [`This file predates hand-placed meander tracks -- ${countPhrase} couldn't be carried over and were dropped. Everything else imported as-is; use "Place meander path" to add new ones.`],
-  };
+  let payload = obj;
+  const notes = [];
+
+  if (!Array.isArray(payload.meanderPaths)) {
+    const oldCount = typeof payload.meanderCount === "number" ? payload.meanderCount : null;
+    const trackWord = oldCount === 1 ? "track" : "tracks";
+    const countPhrase = oldCount === null ? "any auto-generated meander tracks" : `its ${oldCount} auto-generated meander ${trackWord}`;
+    payload = { ...payload, meanderPaths: [] };
+    notes.push(`This file predates hand-placed meander tracks -- ${countPhrase} couldn't be carried over and were dropped. Everything else imported as-is; use "Place meander path" to add new ones.`);
+  }
+
+  if (payload.showSettingOutGrid === undefined || payload.settingOutOriginCorner === undefined) {
+    payload = { ...payload, showSettingOutGrid: payload.showSettingOutGrid ?? false, settingOutOriginCorner: payload.settingOutOriginCorner ?? "minXminY" };
+  }
+
+  return { payload, notes };
 }
 
 // ---- validation -------------------------------------------------------------------

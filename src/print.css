@@ -1,0 +1,33 @@
+.print-sheet {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+@media print {
+  @page {
+    size: A4 landscape;
+    margin: 10mm;
+  }
+  .app-shell {
+    display: none !important;
+  }
+  .print-sheet {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+  }
+  .print-sheet,
+  .print-sheet * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .print-sheet svg {
+    width: 100%;
+    height: auto;
+  }
+}

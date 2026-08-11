@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { Delaunay } from "d3-delaunay";
-import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square, Link2, Maximize2, Download, Upload } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Home, Circle as CircleIcon, Square, Link2, Maximize2, Download, Upload, Printer } from "lucide-react";
 
 import {
   PALETTE, INK, INK_SOFT, PAPER, PANEL_BORDER, APP_BG, PLANT_BG, ACCENT,
@@ -18,6 +18,7 @@ import {
   polygonEdgeLengths, polylineSegmentLengths, pointAtDistance, closestPointOnPolyline,
 } from "./lib/geometryUtils";
 import { hexSizeFromPaver, hexCorners, makeHexGrid, squareCorners, rectCorners, makeRectGrid } from "./lib/tileGrids";
+import { deriveSettingOutSpacing, originCornerPoint, computeSettingOutGrid } from "./lib/settingOutGrid";
 import {
   makeOrganicRoutedPath, makeOrganicMultiWaypointPath, snapToPathOrPatio, validatePathWidth,
   makePatioBlob, sampleAlongPolyline, squarePolygonFromDrag, rectPolygonFromDrag, circlePolygonFromDrag,
@@ -27,6 +28,8 @@ import { boundedVoronoiPolygons, relaxPoints } from "./lib/voronoiZones";
 import { fitViewportToBBox, matchAspect, zoomViewport, panViewport, clampZoomWidth, scaleLabelForMmPerPx } from "./lib/viewport";
 import { serializeBoundary, serializeDesign, downloadJSON, readImportFile, migrateDesignPayload, validateImportPayload, maxIdSuffix } from "./lib/persistence";
 import { Section, Row, Stat, Toggle, ShapeButton, PlaceButton, NumInput, AnchorRadialMenu, WaypointRadialMenu, selectStyle, tinyInputStyle, iconBtnStyle, primaryBtnStyle } from "./components/ui";
+import { SettingOutOverlay } from "./components/SettingOutOverlay";
+import PrintSheet from "./components/PrintSheet";
 
 // ============================================================
 // Main component
@@ -127,12 +130,20 @@ export default function GardenPavingDesigner() {
   const [showCenterlines, setShowCenterlines] = useState(true);
   const [showPlanting, setShowPlanting] = useState(true);
 
+  // --- setting-out reference grid: a dimensioned measurement overlay a tiler can use to
+  // locate rows/courses on site, independent of the tile grid rendering itself ---
+  const [showSettingOutGrid, setShowSettingOutGrid] = useState(false);
+  const [settingOutOriginCorner, setSettingOutOriginCorner] = useState("minXminY");
+
   // --- pan/zoom viewport: an mm-space window into an otherwise infinite canvas, always
   // resized to exactly fill the on-screen canvas element (see the ResizeObserver below) ---
   const [viewport, setViewport] = useState({ x: -5000, y: -5000, w: 10000, h: 10000 });
   const [canvasSize, setCanvasSize] = useState({ w: 1, h: 1 }); // on-screen px size of the canvas element
   const [isPanning, setIsPanning] = useState(false);
   const [spaceHeld, setSpaceHeld] = useState(false);
+  // transient (non-persisted) print-lifecycle gate -- mounting PrintSheet only while this
+  // is true avoids permanently doubling the tile SVG's DOM node count for large gardens
+  const [printPreviewActive, setPrintPreviewActive] = useState(false);
   const panLastRef = useRef(null); // last client {x,y} while a pan gesture is in flight
 
   const svgRef = useRef(null);
@@ -195,6 +206,20 @@ export default function GardenPavingDesigner() {
       window.removeEventListener("keyup", onKeyUp);
     };
   }, []);
+
+  // triggers the browser's native print dialog once the (otherwise hidden) PrintSheet has
+  // mounted and laid out; "afterprint" fires whether the user prints or cancels, so it's
+  // also how printPreviewActive gets turned back off again
+  useEffect(() => {
+    if (!printPreviewActive) return;
+    const onAfterPrint = () => setPrintPreviewActive(false);
+    window.addEventListener("afterprint", onAfterPrint);
+    const raf = requestAnimationFrame(() => window.print());
+    return () => {
+      window.removeEventListener("afterprint", onAfterPrint);
+      cancelAnimationFrame(raf);
+    };
+  }, [printPreviewActive]);
 
   // ---- interactions: click-to-place, drag-to-move ----
   // Maps a mouse/touch event to an mm-space point via the SVG's own screen transform, so it
@@ -273,6 +298,16 @@ export default function GardenPavingDesigner() {
     if (geom.shape === "square") return squareCorners(cx, cy, geom.size * scale, 0);
     return rectCorners(cx, cy, geom.width * scale, geom.height * scale, geom.rotationDeg);
   }, [geom]);
+
+  // ---- setting-out reference grid: computed unconditionally (not gated on the show
+  // toggle) since it's cheap line geometry and the print sheet needs it regardless of the
+  // on-screen toggle's state ----
+  const settingOutSpec = useMemo(() => deriveSettingOutSpacing(geom), [geom]);
+  const settingOutGrid = useMemo(() => {
+    if (!hasBoundary) return null;
+    const origin = originCornerPoint(gardenBoundary, settingOutOriginCorner);
+    return computeSettingOutGrid({ boundaryPoly: gardenBoundary, origin, ...settingOutSpec });
+  }, [hasBoundary, gardenBoundary, settingOutOriginCorner, settingOutSpec]);
 
   // ---- main paths ----
   const rng = useMemo(() => mulberry32(seed * 9973 + 17), [seed]);
@@ -821,6 +856,7 @@ export default function GardenPavingDesigner() {
       zoneCount, relaxIters, wobbleMm, seed,
       scatterDensity, scatterMaxMm,
       showZones, showTiles, showBoundary, showAnchors, showCenterlines, showPlanting,
+      showSettingOutGrid, settingOutOriginCorner,
     }), `garden-design-${Date.now()}.json`);
   };
   const exportBoundary = () => {
@@ -911,6 +947,8 @@ export default function GardenPavingDesigner() {
       setShowAnchors(payload.showAnchors);
       setShowCenterlines(payload.showCenterlines);
       setShowPlanting(payload.showPlanting);
+      setShowSettingOutGrid(payload.showSettingOutGrid);
+      setSettingOutOriginCorner(payload.settingOutOriginCorner);
       bumpUidCounterPast([...payload.exclusionZones.map((z) => z.id), ...payload.anchors.map((a) => a.id), ...payload.meanderPaths.map((m) => m.id)]);
     }
     resetTransientToolState();
@@ -932,7 +970,8 @@ export default function GardenPavingDesigner() {
   const canvasCursor = isPanning ? "grabbing" : spaceHeld ? "grab" : connectFromId ? "crosshair" : placeMode ? "crosshair" : dragId ? "grabbing" : "default";
 
   return (
-    <div style={{ display: "flex", height: "100vh", width: "100%", background: APP_BG, fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", color: INK }}>
+    <>
+    <div className="app-shell" style={{ display: "flex", height: "100vh", width: "100%", background: APP_BG, fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", color: INK }}>
       {/* ---------------- control rail ---------------- */}
       <div style={{ width: 320, minWidth: 320, background: PAPER, borderRight: `1px solid ${PANEL_BORDER}`, overflowY: "auto", padding: "18px 16px" }}>
         <div style={{ fontFamily: "Georgia, 'Times New Roman', serif", fontSize: 20, fontWeight: 700, marginBottom: 2, color: INK }}>
@@ -1258,6 +1297,22 @@ export default function GardenPavingDesigner() {
           <Toggle label="Anchors" value={showAnchors} onChange={setShowAnchors} />
         </Section>
 
+        <Section title="Setting-out plan">
+          <Toggle label="Show reference grid" value={showSettingOutGrid} onChange={setShowSettingOutGrid} />
+          <Row label="Origin corner">
+            <select style={selectStyle} value={settingOutOriginCorner} onChange={(e) => setSettingOutOriginCorner(e.target.value)}>
+              <option value="minXminY">Top-left</option>
+              <option value="maxXminY">Top-right</option>
+              <option value="minXmaxY">Bottom-left</option>
+              <option value="maxXmaxY">Bottom-right</option>
+            </select>
+          </Row>
+          <button onClick={() => setPrintPreviewActive(true)} disabled={!hasBoundary}
+            style={{ ...primaryBtnStyle, width: "100%", marginTop: 4, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, opacity: hasBoundary ? 1 : 0.4, cursor: hasBoundary ? "pointer" : "not-allowed" }}>
+            <Printer size={13} /> Print setting-out plan
+          </button>
+        </Section>
+
         <div style={{ marginTop: 18, padding: "10px 12px", background: "#F1ECE0", borderRadius: 6, fontSize: 10.5, color: INK_SOFT, lineHeight: 1.5 }}>
           Meander tracks don't auto-route around other paths or patios -- only the boundary and
           house/exclusion zones, same as normal paths. If a track's leg crosses something it
@@ -1360,6 +1415,8 @@ export default function GardenPavingDesigner() {
               <polygon points={gardenBoundary.map((p) => p.join(",")).join(" ")}
                 fill="none" stroke="#9C927B" strokeDasharray={`${BOUNDARY_DASH_MM[0]} ${BOUNDARY_DASH_MM[1]}`} strokeWidth={BOUNDARY_STROKE_MM} />
             )}
+
+            {showSettingOutGrid && <SettingOutOverlay grid={settingOutGrid} />}
 
             {/* selected shape's outline + draggable vertex handles -- handle/stroke sizes are
                 screen-pixel constants (via mmPerPx) so they stay grabbable at any zoom */}
@@ -1575,5 +1632,14 @@ export default function GardenPavingDesigner() {
         </div>
       </div>
     </div>
+    {printPreviewActive && (
+      <PrintSheet
+        gardenW={gardenW} gardenH={gardenH} gardenBoundary={gardenBoundary} exclusionZones={exclusionZones}
+        paved={paved} tileCornersFn={tileCornersFn} settingOutGrid={settingOutGrid}
+        tileShape={tileShape} paverAcrossFlats={paverAcrossFlats} paverSize={paverSize}
+        paverWidth={paverWidth} paverHeight={paverHeight} rectBond={rectBond} rotationDeg={rotationDeg}
+      />
+    )}
+    </>
   );
 }

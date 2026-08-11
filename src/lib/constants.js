@@ -78,3 +78,15 @@ export const ANCHOR_MENU_BUTTON_PX = 26;
 export const ANCHOR_MENU_ICON_PX = 13;
 export const ANCHOR_MENU_OFFSET_X_PX = 22;
 export const ANCHOR_MENU_OFFSET_Y_PX = 28;
+
+// ============================================================
+// Setting-out reference grid -- a distinct "blueprint blue" so it reads as a
+// measurement overlay, not part of the design itself. Fixed mm sizes, same
+// true-to-scale reasoning as the rendering sizes block above.
+// ============================================================
+export const SETTING_OUT_COLOR = "#2B5B7A";
+export const SETTING_OUT_AXIS_STROKE_MM = 16;
+export const SETTING_OUT_LINE_STROKE_MM = 6;
+export const SETTING_OUT_LINE_DASH_MM = [30, 18];
+export const SETTING_OUT_LABEL_FONT_MM = 90;
+export const SETTING_OUT_ORIGIN_R_MM = 60;
